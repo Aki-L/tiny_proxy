@@ -1,7 +1,12 @@
 #include "csapp.h"
+#include "tools/threadpool.h"
 
+#define CONNFD_POOL_SIZE 7
+
+pthread_mutex_t connfd_mutex;
 
 void doit(int fd);
+void *doit_proxy(void *fdp);
 int build_requesthdrs(char *rq, rio_t *rp);
 int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname);
 int forward_requesthdrs(char *hostname, char *port, char *request);
@@ -20,14 +25,27 @@ int main(int argc, char **argv){
 	}
 
 	listenfd = Open_listenfd(argv[1]);
+	threadpool_t *pool = threadpool_create(CONNFD_POOL_SIZE);
+	pthread_mutex_init(&connfd_mutex, NULL);
 	while(1){
 		clientlen = sizeof(clientaddr);
+		pthread_mutex_lock(&connfd_mutex);
 		connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
 		Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
 		printf("Accept connection from (%s, %s)\n", hostname, port);
-		doit(connfd);
-		Close(connfd);
+		//doit(connfd);
+		threadpool_add(pool, &doit_proxy, (void*)(&connfd));
 	}
+	threadpool_destroy(pool);
+	pthread_mutex_destroy(&connfd_mutex);
+}
+
+void *doit_proxy(void *fdp){
+	int fd = *((int *)fdp);
+	printf("doit proxy with fd %d\n", fd);
+	pthread_mutex_unlock(&connfd_mutex);
+	doit(fd);
+	Close(fd);
 }
 
 void doit(int fd){
@@ -222,10 +240,10 @@ int forward_requesthdrs(char *hostname, char *rq_port, char *request){
 }
 
 int parse_hostname(char *hostname, char *port){
-	char *token;
+	char *token, save_buffer[MAXBUF];
 	const char s[2] = ":";
-	token = strtok(hostname, s);
-	if((token = strtok(NULL, s))!=NULL){
+	token = strtok_r(hostname, s, NULL);
+	if((token = strtok_r(NULL, s, &save_buffer))!=NULL){
 		strcpy(port, token);
 	}else{
 		strcpy(port, "80");
