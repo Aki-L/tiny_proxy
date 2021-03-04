@@ -12,7 +12,10 @@ int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname);
 int forward_requesthdrs(char *hostname, char *port, char *request);
 int parse_hostname(char *hostname, char *port);
 int build_reply(int fd, char *reply);
+int forward_requestheader(int fd, rio_t *rp, char *host);
+int forward_reply(int serverfd, int clientfd);
 
+int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server);
 
 int main(int argc, char **argv){
 	int listenfd, connfd;
@@ -45,7 +48,6 @@ void *doit_proxy(void *fdp){
 	printf("doit proxy with fd %d\n", fd);
 	pthread_mutex_unlock(&connfd_mutex);
 	doit(fd);
-	Close(fd);
 }
 
 void doit(int fd){
@@ -53,21 +55,36 @@ void doit(int fd){
 	struct stat sbuf;
 	char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], rq_port[MAXLINE];
 	char hostname[MAXLINE], filename[MAXLINE], cgiargs[MAXLINE], request[MAXLINE], reply[MAXLINE];
-	rio_t rio;
+	rio_t rio_client, rio_server;
 
-	Rio_readinitb(&rio, fd);
-	Rio_readlineb(&rio, buf, MAXLINE);
+	Rio_readinitb(&rio_client, fd);
+	Rio_readlineb(&rio_client, buf, MAXLINE);
 	printf("Request headers:\n");
 	printf("%s", buf);
 	sscanf(buf, "%s %*[^/]//%[^/]%[^ ] %s", method, hostname, uri, version);
 	printf("method: %s, hostname: %s, uri: %s, version: %s\n", method, hostname, uri, version);
-	if(strcasecmp(method, "GET")){
-		clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
-		return;
+//	if(strcasecmp(method, "GET")){
+//		clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
+//		return;
+//	}
+	sprintf(request, "%s %s %s\r\n", method, uri, version);
+	parse_hostname(hostname, rq_port);	
+	serverfd = Open_clientfd(hostname, rq_port);
+	Rio_readinitb(&rio_server, serverfd);
+	Rio_writen(serverfd, request, strlen(request));
+	if(!strcmp(version, "HTTP/1.0")){
+		forward_requestheader(serverfd, &rio_client, hostname);
+		reply_nonconnection(serverfd, fd, &rio_server);
+		Close(serverfd);
+		Close(fd);
+	}else if(!strcmp(version, "HTTP/1.1")){
+		
+	}else{
+		clienterror(fd, version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
 	}
-	sprintf(request, "%s %s HTTP/1.0\r\n", method, uri);
 
-	parse_hostname(hostname, rq_port);
+
+
 	/*
 	is_host_set = build_requesthdrs(request, &rio);
 	set_defaultrequesthdrs(request, is_host_set, hostname);
@@ -76,14 +93,19 @@ void doit(int fd){
 	Rio_writen(fd, reply, strlen(reply));
 	*/
 
-	serverfd = Open_clientfd(hostname, rq_port);
-	Rio_writen(serverfd, request, strlen(request));
-	forward_requestheader(serverfd, &rio, hostname);
 
-	forward_reply(serverfd, fd);
-	Close(serverfd);
+	//forward_reply(serverfd, fd);
+	//Close(serverfd);
 }
 
+int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server){
+	char buf[MAXLINE];
+	size_t n;
+	while((n = Rio_readnb(rp_server, buf, MAXLINE))!=0){
+		printf("proxy received %d bytes, forwarded to client", n);
+		Rio_writen(clientfd, buf, n);
+	}
+}
 int forward_reply(int serverfd, int clientfd){
         rio_t rio;
         int length;
@@ -112,6 +134,7 @@ int forward_reply(int serverfd, int clientfd){
                 }
 		Rio_writen(clientfd, buf, strlen(buf));
         }
+
 
 	/* devide and process response body */
         if((!strcmp(type, "text/html"))||(!strcmp(type, "text/plain"))){
@@ -142,6 +165,11 @@ int forward_requestheader(int fd, rio_t *rp, char *host){
         while(1){
                 Rio_readlineb(rp, buf, MAXLINE);
                 if(!strcmp(buf, "\r\n")) {
+        		if(!is_host_set){
+				sprintf(buf, "Host: %s", host);
+				printf("%s", buf);
+				Rio_writen(fd, buf, strlen(buf));
+			}
                         Rio_writen(fd, buf, strlen(buf));
                         break;
                 }
@@ -151,13 +179,6 @@ int forward_requestheader(int fd, rio_t *rp, char *host){
 
                 Rio_writen(fd, buf, strlen(buf));
         }
-
-        if(!is_host_set){
-		sprintf(buf, "Host: %s", host);
-		printf("%s", buf);
-		Rio_writen(fd, buf, strlen(buf));
-	}
-        
 }
 
 int build_reply(int fd, char *reply){
@@ -240,10 +261,10 @@ int forward_requesthdrs(char *hostname, char *rq_port, char *request){
 }
 
 int parse_hostname(char *hostname, char *port){
-	char *token, save_buffer[MAXBUF];
+	char *token, *save_ptr;
 	const char s[2] = ":";
-	token = strtok_r(hostname, s, NULL);
-	if((token = strtok_r(NULL, s, &save_buffer))!=NULL){
+	token = strtok_r(hostname, s, &save_ptr);
+	if((token = strtok_r(NULL, s, &save_ptr))!=NULL){
 		strcpy(port, token);
 	}else{
 		strcpy(port, "80");
@@ -262,10 +283,4 @@ void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longms
 
 	sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
 	Rio_writen(fd, buf, strlen(buf));
-	sprintf(buf, "Content-type: text/html\r\n");
-	Rio_writen(fd, buf, strlen(buf));
-	sprintf(buf, "Content-length: %d\r\n\r\n", (int)strlen(body));
-	Rio_writen(fd, buf, strlen(buf));
-	Rio_writen(fd, body, strlen(body));
 }
-
