@@ -1,10 +1,13 @@
 #include "csapp.h"
 #include "tools/threadpool.h"
+#include <sys/epoll.h>
 
 #define CONNFD_POOL_SIZE 7
+#define EPOLL_SIZE 1000
+#define EPOLL_EVENTS 100
 
 pthread_mutex_t connfd_mutex;
-
+int epollfd;
 void doit(int fd);
 void *doit_proxy(void *fdp);
 int build_requesthdrs(char *rq, rio_t *rp);
@@ -14,11 +17,12 @@ int parse_hostname(char *hostname, char *port);
 int build_reply(int fd, char *reply);
 int forward_requestheader(int fd, rio_t *rp, char *host);
 int forward_reply(int serverfd, int clientfd);
-
+int setnonblocking(int fd);
 int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server);
 
 int main(int argc, char **argv){
-	int listenfd, connfd;
+	int listenfd, connfd, nfds, n;
+	struct epoll_event ev, events[EPOLL_EVENTS];
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t clientlen;
 	struct sockaddr_storage clientaddr;
@@ -30,17 +34,58 @@ int main(int argc, char **argv){
 	listenfd = Open_listenfd(argv[1]);
 	threadpool_t *pool = threadpool_create(CONNFD_POOL_SIZE);
 	pthread_mutex_init(&connfd_mutex, NULL);
+	epollfd = epoll_create(EPOLL_SIZE);
+	if(epollfd == -1){
+		perror("epoll_create error");
+		exit(-1);
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.fd = listenfd;
+	if(epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &ev)==-1){
+		perror("epoll_ctl: listen_sock");
+		exit(-1);
+	}
+
 	while(1){
-		clientlen = sizeof(clientaddr);
-		pthread_mutex_lock(&connfd_mutex);
-		connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
-		Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
-		printf("Accept connection from (%s, %s)\n", hostname, port);
+		nfds = epoll_wait(epollfd, events, EPOLL_EVENTS, -1);
+		if(nfds == -1){
+			perror("epoll_wait");
+			exit(-1);
+		}
+		for(n = 0; n < nfds; n++){
+			if(events[n].data.fd==listenfd){
+				clientlen = sizeof(clientaddr);
+				//pthread_mutex_lock(&connfd_mutex);
+				connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+				if(connfd == -1){
+					perror("accept");
+					exit(0);
+				}
+				Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
+				printf("Accept connection from (%s, %s)\n", hostname, port);
+				setnonblocking(connfd);
+				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+				ev.data.fd = connfd;
+				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev) == -1){
+					perror("epoll_ctl: connfd");
+					exit(-1);
+				}
+			}else{
+				pthread_mutex_lock(&connfd_mutex);
+				threadpool_add(pool, &doit_proxy, (void*)(&(events[n].data.fd)));		
+			}
+		}
 		//doit(connfd);
-		threadpool_add(pool, &doit_proxy, (void*)(&connfd));
+		//threadpool_add(pool, &doit_proxy, (void*)(&connfd));
 	}
 	threadpool_destroy(pool);
 	pthread_mutex_destroy(&connfd_mutex);
+}
+
+int setnonblocking(int fd){
+	int flag = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, flag| O_NONBLOCK);
 }
 
 void *doit_proxy(void *fdp){
@@ -78,7 +123,14 @@ void doit(int fd){
 		Close(serverfd);
 		Close(fd);
 	}else if(!strcmp(version, "HTTP/1.1")){
-		
+		if(!strcasecmp(method, "CONNECT")){
+					
+		}else{
+			clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
+			Close(serverfd);
+			Close(fd);
+			return;
+		}
 	}else{
 		clienterror(fd, version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
 	}
@@ -151,7 +203,7 @@ int forward_reply(int serverfd, int clientfd){
 
 int forward_requestheader(int fd, rio_t *rp, char *host){
         char buf[MAXLINE], headername[MAXLINE], headerdata[MAXLINE];
-        int is_host_set = 0;
+        int is_host_set = 0, read_bytes;
 
         printf("Request header:\n");
 
@@ -163,7 +215,17 @@ int forward_requestheader(int fd, rio_t *rp, char *host){
         Rio_writen(fd, buf, strlen(buf));
 
         while(1){
-                Rio_readlineb(rp, buf, MAXLINE);
+                while((read_bytes = Rio_readlineb(rp, buf, MAXLINE))<=0){
+			if(read_bytes<0){
+				if((errno != EINTR) && (errno != EWOULDBLOCK) && (errno != EAGAIN)){
+					perror("Rio_readlineb: forward_requestheader");
+					break;
+				}
+			}else{
+				printf("connection closed by remote server");
+				break;
+			}
+		}
                 if(!strcmp(buf, "\r\n")) {
         		if(!is_host_set){
 				sprintf(buf, "Host: %s", host);
