@@ -2,12 +2,43 @@
 #include "tools/threadpool.h"
 #include "tools/concurrent_hashmap.h"
 #include "tools/parse_requestline.h"
+#include "proxy.h"
 #include <sys/epoll.h>
 
 #define CONNFD_POOL_SIZE 7
 #define EPOLL_SIZE 1000
 #define EPOLL_EVENTS 100
 #define HASHMAP_SIZE 100
+
+/**********************************************************************************************/
+/*
+ *
+ *
+ *
+ *                  typedef struct connection_status{
+ *                          int keep_alive;
+ *                          char transfer_encoding[TYPESTRLEN];
+ *                          int client_shuttingdown;
+ *                          int server_shuttingdown;
+ *                          int content_length;
+ *                          char content_type[TYPESTRLEN];
+ *                  } connection_status_t;
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ *
+ * *******************************************************************************************/
 
 pthread_mutex_t connfd_mutex;
 int epollfd;
@@ -18,7 +49,7 @@ int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname);
 int forward_requesthdrs(char *hostname, char *port, char *request);
 int parse_hostname(char *hostname, char *port);
 int build_reply(int fd, char *reply);
-int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method);
+int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method, connection_status_t *cstatus);
 int forward_reply(int serverfd, int clientfd);
 int setnonblocking(int fd);
 int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server);
@@ -156,6 +187,7 @@ void doit(int fd){
 	rio_t rio_client, rio_server;
 	struct epoll_event ev_server, ev_client;
 	requestline_data_t *rqdata = (requestline_data_t *)malloc(sizeof(requestline_data_t));
+	connection_status_t *cstatus = (connection_status_t *)malloc(sizeof(connection_status_t));
 
 	rio_readinitb(&rio_client, fd);
 	rio_readlineb(&rio_client, buf, MAXLINE);
@@ -186,7 +218,7 @@ void doit(int fd){
 	if(!strcmp(rqdata->version, "HTTP/1.0")){
 		sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
 		rio_writen(serverfd, request, strlen(request));
-		forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method);
+		forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
 		reply_nonconnection(serverfd, fd, &rio_server);
 		Close(serverfd);
 		printf("closing fd: %d\n", serverfd);
@@ -230,7 +262,7 @@ void doit(int fd){
 		}else if (!strcasecmp(rqdata->method, "GET")){
 			sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
 			rio_writen(serverfd, request, strlen(request));			
-			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method);
+			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
 			reply_nonconnection(serverfd, fd, &rio_server);
 			Close(serverfd);
 			printf("closing fd: %d\n", serverfd);
@@ -238,7 +270,7 @@ void doit(int fd){
 			printf("closing fd: %d\n", fd);
 		}else{
 			//printf("rqdata: 0x%x, method: %s", rqdata, rqdata->method);
-			clienterror(fd, rqdata->method, "501", "Not implemented", "FUCK YOU");
+			clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
 			Close(serverfd);
 			printf("closing fd: %d\n", serverfd);
 			Close(fd);
@@ -248,7 +280,7 @@ void doit(int fd){
 		clienterror(fd, rqdata->version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
 	}
 	free(rqdata);
-
+	free(cstatus);
 
 	/*
 	is_host_set = build_requesthdrs(request, &rio);
@@ -314,7 +346,7 @@ int forward_reply(int serverfd, int clientfd){
         return 0;
 }
 
-int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method){
+int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method, connection_status_t *cstatus){
         char buf[MAXLINE], headername[MAXLINE], headerdata[MAXLINE];
         int is_host_set = 0, read_bytes;
 
@@ -324,18 +356,19 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
         rio_writen(fd, buf, strlen(buf));
         sprintf(buf, "Connection: close\r\n");     
         rio_writen(fd, buf, strlen(buf));
-        sprintf(buf, "Proxy-Connection: close\r\n");      
+        sprintf(buf, "Proxy-Connection: close\r\n");
         rio_writen(fd, buf, strlen(buf));
 
         while(1){
-                while((read_bytes = rio_readlineb(rp, buf, MAXLINE))<=0){
+                if((read_bytes = rio_readlineb(rp, buf, MAXLINE))<=0){
 			if(read_bytes<0){
 				if((errno != EINTR) && (errno != EWOULDBLOCK) && (errno != EAGAIN)){
 					perror("rio_readlineb: forward_requestheader");
-					break;
+					continue;
 				}
 			}else{
-				printf("connection closed by remote server");
+				printf("connection closed by remote client");
+				cstatus->client_shuttingdown = 1;
 				break;
 			}
 		}
@@ -350,7 +383,16 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
                 }
                 sscanf(buf, "%[^:]: %s", headername, headerdata);
                 if(!strcmp(headername, "Host")) is_host_set = 1;
-		if((!strcmp(headername, "User-Agent"))||(!strcmp(headername, "Connection"))||(!strcmp(headername, "Proxy-Connection"))) continue;
+		if(!strcmp(headername, "User-Agent")){
+			continue;
+		}
+		if(!strcmp(headername, "Connection")){
+
+			continue;
+		}
+		if(!strcmp(headername, "Proxy-Connection")){
+			continue;
+		}
 
                 rio_writen(fd, buf, strlen(buf));
         }
