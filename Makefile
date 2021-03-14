@@ -7,8 +7,8 @@ LIB = -lpthread
 
 all: tiny cgi proxy
 
-proxy: proxy.c csapp.o threadpool.o
-	$(CC) $(CFLAGS) -g3 -o proxy proxy.c csapp.o tools/threadpool.o $(LIB)
+proxy: proxy.c csapp.o threadpool.o concurrent_hashmap.o parse_requestline.o
+	$(CC) $(CFLAGS) -g3 -o proxy proxy.c csapp.o tools/threadpool.o tools/concurrent_hashmap.o tools/parse_requestline.o $(LIB)
 
 tiny: tiny.c csapp.o
 	$(CC) $(CFLAGS) -g3 -o tiny tiny.c csapp.o $(LIB)
@@ -19,10 +19,11 @@ csapp.o: csapp.c
 cgi:
 	(cd cgi-bin; make)
 
-threadpool.o:
+threadpool.o concurrent_hashmap.o parse_requestline.o:
 	(cd tools; make)
 
 clean:
-	rm -f *.o tiny *~
+	rm -f *.o tiny *~ proxy
 	(cd cgi-bin; make clean)
+	(cd tools; make clean)
 
