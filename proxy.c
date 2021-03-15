@@ -3,6 +3,7 @@
 #include "tools/concurrent_hashmap.h"
 #include "tools/parse_requestline.h"
 #include "proxy.h"
+#include <assert.h>
 #include <sys/epoll.h>
 
 #define CONNFD_POOL_SIZE 7
@@ -16,11 +17,14 @@
  *
  *
  *                  typedef struct connection_status{
- *                          int keep_alive;
- *                          char transfer_encoding[TYPESTRLEN];
+ *                          int client_setclose;
+ *                          int server_setclose;
+ *                          char client_transfer_encoding[TYPESTRLEN];
+ *                          char server_transfer_encoding[TYPESTRLEN];
  *                          int client_shuttingdown;
  *                          int server_shuttingdown;
- *                          int content_length;
+ *                          int client_content_length;
+ *                          int server_content_length;
  *                          char content_type[TYPESTRLEN];
  *                  } connection_status_t;
  *
@@ -50,9 +54,14 @@ int forward_requesthdrs(char *hostname, char *port, char *request);
 int parse_hostname(char *hostname, char *port);
 int build_reply(int fd, char *reply);
 int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method, connection_status_t *cstatus);
-int forward_reply(int serverfd, int clientfd);
+int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus);
 int setnonblocking(int fd);
 int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server);
+int forward_chunked(int fd, rio_t *rp, char* trailer);
+int getchunksize(char *buf);
+int hex2num(char ch);
+
+int reset_oneshot(int epollfd, int fd);
 
 void* do_connect(void* fdp);
 chmap_t *fdmap;
@@ -106,7 +115,7 @@ int main(int argc, char **argv){
 				}
 				getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
 				printf("[main] Accept connection from (%s, %s)\n", hostname, port);
-				//setnonblocking(connfd);
+				setnonblocking(connfd);
 				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 				ev.data.fd = connfd;
 				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev) == -1){
@@ -165,6 +174,13 @@ void* do_connect(void* fdp){
 			if(read_bytes<MAXLINE) return;
 		}
 	}
+}
+
+int reset_oneshot(int epollfd, int fd){
+    struct epoll_event event;
+    event.data.fd = fd;
+    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    return epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 }
 
 int setnonblocking(int fd){
@@ -259,15 +275,32 @@ void doit(int fd){
 			sprintf(buf, "\r\n");
 			rio_writen(fd, buf, strlen(buf));
 
-		}else if (!strcasecmp(rqdata->method, "GET")){
+		}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
 			sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
 			rio_writen(serverfd, request, strlen(request));			
 			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
-			reply_nonconnection(serverfd, fd, &rio_server);
-			Close(serverfd);
-			printf("closing fd: %d\n", serverfd);
-			Close(fd);
-			printf("closing fd: %d\n", fd);
+			//reply_nonconnection(serverfd, fd, &rio_server);
+			forward_reply(fd, &rio_server, cstatus);
+			if(cstatus->server_setclose || cstatus->server_shuttingdown){
+				Close(serverfd);
+				printf("closing fd: %d\n", serverfd);
+				/*if(epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL)==-1){
+					perror("epoll_ctl_del: serverfd");
+				}*/
+			}else{
+				printf("reset_oneshot: %d\n", serverfd);
+				reset_oneshot(epollfd, serverfd);
+			}
+			if(cstatus->client_setclose || cstatus->client_shuttingdown){
+				Close(fd);
+				printf("closing fd: %d\n", fd);
+				/*if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+					perror("epoll_ctl_del: clientfd");
+				}*/
+			}else{
+				printf("reset_oneshot: %d\n", fd);
+				reset_oneshot(epollfd, fd);
+			}
 		}else{
 			//printf("rqdata: 0x%x, method: %s", rqdata, rqdata->method);
 			clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
@@ -303,19 +336,32 @@ int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server){
 		rio_writen(clientfd, buf, n);
 	}
 }
-int forward_reply(int serverfd, int clientfd){
+int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
         rio_t rio;
-        int length;
-        char buf[MAXLINE], type[MAXLINE], *srcp;
+        int length, is_contentlength_set = 0;
+        char buf[MAXLINE], type[MAXLINE], *srcp, version[MAXLINE], code[MAXLINE], msg[MAXLINE];
         char headername[MAXLINE], headerdata[MAXLINE];
 
-        rio_readinitb(&rio, serverfd);
 
-        rio_readlineb(&rio, buf, MAXLINE);
+        if(rio_readlineb(rp_server, buf, MAXLINE)==0){
+		cstatus->server_shuttingdown = 1;
+		return 0;
+	}
+	sscanf(buf, "%s %s %s", version, code, msg);
+	if(!strcmp(version, "HTTP/1.0")){
+		cstatus->server_setclose = 1;
+	}
         rio_writen(clientfd, buf, strlen(buf));
 
+	if(cstatus->client_setclose){
+		sprintf(buf, "Connection: close\r\n");
+        	rio_writen(clientfd, buf, strlen(buf));
+        	sprintf(buf, "Proxy-Connection: close\r\n");
+        	rio_writen(clientfd, buf, strlen(buf));
+	}
+
         while(1){
-                rio_readlineb(&rio, buf, MAXLINE);
+                rio_readlineb(rp_server, buf, MAXLINE);
 
                 if(!strcmp(buf, "\r\n")) {
 			rio_writen(clientfd, buf, strlen(buf));
@@ -323,32 +369,66 @@ int forward_reply(int serverfd, int clientfd){
 		}
 
                 sscanf(buf, "%[^:]: %s", headername, headerdata);
-                if(!strcmp(headername, "Content-length")){
-                        length = atoi(headerdata);
+		if(!strcmp(headername, "Connection")){
+			printf("[server] Connection: %s\n", headerdata);
+			if(!strcasecmp(headerdata, "close")){
+				cstatus->server_setclose = 1;
+			}
+			continue;
+		}
+		if(!strcmp(headername, "Proxy-Connection")){
+			printf("[server] Proxy-Connection: %s\n", headerdata);
+			if(!strcasecmp(headerdata, "close")){
+				cstatus->server_setclose = 1;
+			}
+			continue;
+		}
+
+		if(!strcasecmp(headername, "Trailer")){
+			strcpy(cstatus->server_trailer, headerdata);
+		}
+
+		if(!strcmp(headername, "Content-length")){
+                        cstatus->server_content_length = atoi(headerdata);
+                        is_contentlength_set = 1;
                 }
-                if(!strcmp(headername, "Content-type")){
-                        strcpy(type, headerdata);
+
+                if(!strcmp(headername, "Transfer-Encoding")){
+                        strcpy(cstatus->server_transfer_encoding, headerdata);
                 }
+
 		rio_writen(clientfd, buf, strlen(buf));
         }
 
+	if(!strcasecmp(cstatus->server_transfer_encoding, "chunked")){
+                forward_chunked(clientfd, rp_server, cstatus->server_trailer);
+        }else if(is_contentlength_set){
+                char contentbuf[cstatus->server_content_length+1];
+                if(rio_readnb(rp_server, contentbuf, cstatus->server_content_length)==0){
+			cstatus->server_shuttingdown = 1;
+		}
+                rio_writen(clientfd, contentbuf, cstatus->server_content_length);
+	}else{
+                clienterror(clientfd, "server reply", "400", "Bad reply", "reply should contains a valid content-length or be chunked");
+                cstatus->client_setclose = 1;
+                cstatus->server_setclose = 1;
+        }
 
 	/* devide and process response body */
-        if((!strcmp(type, "text/html"))||(!strcmp(type, "text/plain"))){
-                while(rio_readlineb(&rio, buf, MAXLINE)){
-                        rio_writen(clientfd, buf, strlen(buf));
-                }
-        }else{
-		char nbuf[length+1];
-                rio_readnb(&rio, nbuf, length);
-                rio_writen(clientfd, nbuf, length);
-        }
+	/*
+	char nbuf[length+1];
+        if(rio_readnb(rp_server, nbuf, length)==0){
+		cstatus->server_shuttingdown = 1;
+		return 0;
+	}
+        rio_writen(clientfd, nbuf, length);
         return 0;
+	*/
 }
 
 int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method, connection_status_t *cstatus){
         char buf[MAXLINE], headername[MAXLINE], headerdata[MAXLINE];
-        int is_host_set = 0, read_bytes;
+        int is_host_set = 0, is_contentlength_set = 0, read_bytes;
 
         printf("Request header:\n");
 
@@ -369,7 +449,7 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
 			}else{
 				printf("connection closed by remote client");
 				cstatus->client_shuttingdown = 1;
-				break;
+				return -1;
 			}
 		}
                 if(!strcmp(buf, "\r\n")) {
@@ -387,15 +467,108 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
 			continue;
 		}
 		if(!strcmp(headername, "Connection")){
-
+			printf("[client] Connection: %s\n", headerdata);
+			if(!strcasecmp(headerdata, "close")){
+				cstatus->client_setclose = 1;
+			}
 			continue;
 		}
 		if(!strcmp(headername, "Proxy-Connection")){
+			printf("[client] Proxy-Connection: %s\n", headerdata);
+			if(!strcasecmp(headerdata, "close")){
+				cstatus->client_setclose = 1;
+			}
 			continue;
+		}
+
+		if(!strcasecmp(headername, "Trailer")){
+                        strcpy(cstatus->client_trailer, headerdata);
+                }
+
+		if(!strcmp(headername, "Content-length")){
+                        cstatus->client_content_length = atoi(headerdata);
+			is_contentlength_set = 1;
+                }
+
+		if(!strcmp(headername, "Transfer-Encoding")){
+			strcpy(cstatus->client_transfer_encoding, headerdata);
 		}
 
                 rio_writen(fd, buf, strlen(buf));
         }
+
+
+	if(!strcmp(method, "POST")){
+		if(!strcasecmp(cstatus->client_transfer_encoding, "chunked")){
+			forward_chunked(fd, rp, cstatus->client_trailer);
+		}else if(is_contentlength_set){
+			char contentbuf[cstatus->client_content_length+1];
+			if(rio_readnb(rp, contentbuf, cstatus->client_content_length)==0){
+				cstatus->client_shuttingdown = 1;
+			}
+			rio_writen(fd, contentbuf, cstatus->client_content_length);
+		}else{
+			clienterror(fd, method, "400", "Bad request", "POST method should contains a valid content-length or be chunked");
+			cstatus->client_setclose = 1;
+			cstatus->server_setclose = 1;
+		}
+	}
+	return 0;
+}
+
+int forward_chunked(int fd, rio_t *rp, char* trailer){
+	char buf[MAXLINE];
+	int read_bytes, chunksize, content_length;
+	while(1){
+		read_bytes = rio_readlineb(rp, buf, MAXLINE);
+		if(strcmp(buf, "0\r\n")){
+			rio_writen(fd, buf, read_bytes);
+			break;
+		}
+		chunksize = getchunksize(buf);
+		if(chunksize == -1){
+			perror("invalid chunk");
+			return -1;
+		}
+		content_length += chunksize;
+		read_bytes = rio_readnb(rp, buf, chunksize+2);
+		rio_writen(fd, buf, chunksize+2);
+	}
+	if(strlen(trailer)!=0){
+		read_bytes = rio_readlineb(rp, buf, MAXLINE);
+		rio_writen(fd, buf, read_bytes);
+	}
+	read_bytes = rio_readlineb(rp, buf, MAXLINE);
+	assert(!strcmp(buf, "\r\n"));
+	rio_writen(fd, buf, read_bytes);
+	return content_length;
+}
+
+int getchunksize(char *buf){
+	int i, num=0, digit;
+	char ch;
+	for(i = 0 ; i < MAXLINE; i++){
+		ch = buf[i];
+		num*=16;
+		if(!isxdigit(ch)) break;
+		digit = hex2num(ch);
+		if(digit==-1) return -1;
+		num+=digit;
+	}
+	return num;
+}
+
+int hex2num(char ch){
+	if(ch>= '0' && ch<='9'){
+		return ch-'0';
+	}
+	if(ch>='a' && ch<='f'){
+		return 10+ch-'a';
+	}
+	if(ch>='A' && ch<='F'){
+		return 10+ch-'A';
+	}
+	return -1;
 }
 
 int build_reply(int fd, char *reply){
