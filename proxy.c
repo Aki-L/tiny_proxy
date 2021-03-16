@@ -6,7 +6,7 @@
 #include <assert.h>
 #include <sys/epoll.h>
 
-#define CONNFD_POOL_SIZE 7
+#define CONNFD_POOL_SIZE 100
 #define EPOLL_SIZE 1000
 #define EPOLL_EVENTS 100
 #define HASHMAP_SIZE 100
@@ -140,6 +140,7 @@ int main(int argc, char **argv){
 
 void* do_connect(void* fdp){
 	int clientfd = *((int *)fdp);
+	struct epoll_event ev;
 	pthread_mutex_unlock(&connfd_mutex);
 	printf("[do_connect] thread 0x%x entering do_connect with fd %d\n", pthread_self(), clientfd);
 	int serverfd = hashmap_get(fdmap, clientfd);
@@ -150,30 +151,31 @@ void* do_connect(void* fdp){
 		printf("[do_connect] received %d bytes from connect(%d, %d)\n", read_bytes, clientfd, serverfd);
 		if(read_bytes==0){
 			printf("[do_connect] received EOF from connect(%d, %d)\n", clientfd, serverfd);
-			Close(clientfd);
-			printf("[do_connect] closing fd: %d\n", clientfd);
-			Close(serverfd);
-			printf("[do_connect] closing fd: %d\n", serverfd);
 			hashmap_remove(fdmap, clientfd);
 			hashmap_remove(fdmap, serverfd);
 			epoll_ctl(epollfd, EPOLL_CTL_DEL, clientfd, NULL);
 			epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL);
-			break;
+			Close(clientfd);
+			printf("[do_connect] closing fd: %d\n", clientfd);
+			Close(serverfd);
+			printf("[do_connect] closing fd: %d\n", serverfd);
+			return;
 		}else if(read_bytes<0){
 			if(errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK){
 				//rio_writen(serverfd, buf, sizeof(buf));
 				//printf(("[do_connect][forward] %o\n", buf));
-				return;
+				break;
 			}else{
 				perror("rio_readn: do_connect");
-				return;
+				break;
 			}
 		}else{
 			rio_writen(serverfd, buf, read_bytes);
 			printf("[do_connect][forward] %o\n", buf);
-			if(read_bytes<MAXLINE) return;
+			if(read_bytes<MAXLINE) break;
 		}
 	}
+	reset_oneshot(epollfd, clientfd);
 }
 
 int reset_oneshot(int epollfd, int fd){
@@ -196,7 +198,7 @@ void *doit_proxy(void *fdp){
 }
 
 void doit(int fd){
-	int is_static, is_host_set, serverfd;
+	int is_static, is_host_set, serverfd, read_bytes;
 	struct stat sbuf;
 	char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], rq_port[MAXLINE];
 	char hostname[MAXLINE], filename[MAXLINE], cgiargs[MAXLINE], request[MAXLINE], reply[MAXLINE];
@@ -205,113 +207,125 @@ void doit(int fd){
 	requestline_data_t *rqdata = (requestline_data_t *)malloc(sizeof(requestline_data_t));
 	connection_status_t *cstatus = (connection_status_t *)malloc(sizeof(connection_status_t));
 
-	rio_readinitb(&rio_client, fd);
-	rio_readlineb(&rio_client, buf, MAXLINE);
-	printf("Request line:\n");
-	printf("%s", buf);
-	if(parse_requestline(buf, rqdata)==-1){
-		clienterror(fd, method, "400", "Bad request", "Invalid request line");
-		Close(fd);
-		return;
-	}
-	//sscanf(buf, "%s %*[^/]//%[^/]%[^ ] %s", method, hostname, uri, version);
-	printf("method: %s, schema: %s, hostname: %s, port: %s, loc: %s, version: %s\n", rqdata->method, rqdata->schema, rqdata->host, rqdata->port, rqdata->loc, rqdata->version);
-//	if(strcasecmp(method, "GET")){
-//		clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
-//		return;
-//	}
-	//sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
-	//parse_hostname(hostname, rq_port);
+	do{
+		rio_readinitb(&rio_client, fd);
+		rio_readlineb(&rio_client, buf, MAXLINE);
+		printf("Request line:\n");
+		printf("%s\n", buf);
+		if(parse_requestline(buf, rqdata)==-1){
+			printf("parse_requestline error\nclosing fd: %d\n", buf, fd);
+			printf("method: %s, schema: %s, hostname: %s, port: %s, loc: %s, version: %s\n", rqdata->method, rqdata->schema, rqdata->host, rqdata->port, rqdata->loc, rqdata->version);
+			clienterror(fd, method, "400", "Bad request", "Invalid request line");
+			Close(fd);
+			break;
+		}
+		//sscanf(buf, "%s %*[^/]//%[^/]%[^ ] %s", method, hostname, uri, version);
+		printf("method: %s, schema: %s, hostname: %s, port: %s, loc: %s, version: %s\n", rqdata->method, rqdata->schema, rqdata->host, rqdata->port, rqdata->loc, rqdata->version);
+	//	if(strcasecmp(method, "GET")){
+	//		clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
+	//		return;
+	//	}
+		//sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
+		//parse_hostname(hostname, rq_port);
 
-	if((serverfd = open_clientfd(rqdata->host, rqdata->port))<0){
-		clienterror(fd, rqdata->host, "404", "Not found", "Failed to open connection to host");
-		Close(fd);
-		return;
-	}
-	rio_readinitb(&rio_server, serverfd);
-	//rio_writen(serverfd, request, strlen(request));
-	//printf("strcasecmp: %d", !strcasecmp(rqdata->method, "GET"));
-	if(!strcmp(rqdata->version, "HTTP/1.0")){
-		sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
-		rio_writen(serverfd, request, strlen(request));
-		forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
-		reply_nonconnection(serverfd, fd, &rio_server);
-		Close(serverfd);
-		printf("closing fd: %d\n", serverfd);
-		Close(fd);
-		printf("closing fd: %d\n", fd);
-	}else if(!strcmp(rqdata->version, "HTTP/1.1")){
-		if(!strcasecmp(rqdata->method, "CONNECT")){
-			//sprintf(request, "%s %s:%s %s\r\n", rqdata->method, rqdata->host, (strlen(rqdata->port)==0 ? "443" : rqdata->port), rqdata->version);
-			//rio_writen(serverfd, request, strlen(request));
-			//printf("[forward] %s\n", request);
-			while(strcmp(buf, "\r\n")){
-				rio_readlineb(&rio_client, buf, MAXLINE);
-				//rio_writen(serverfd, buf, strlen(buf));
-				printf("[received] %s\n", buf);
-			}
-			//rio_writen(serverfd, buf, strlen(buf));
-			printf("[received] %s\n", buf);
-			
-			sprintf(buf, "HTTP/1.1 200 Connection established\r\n");
-			hashmap_put(fdmap, fd, serverfd);
-			hashmap_put(fdmap, serverfd, fd);
-			setnonblocking(serverfd);
-			ev_server.events = EPOLLIN | EPOLLET;
-			ev_server.data.fd = serverfd;
-			if(epoll_ctl(epollfd, EPOLL_CTL_ADD, serverfd, &ev_server)==-1){
-				perror("epoll_ctl: connect server");
-				exit(-1);
-			}
-			ev_client.events = EPOLLIN | EPOLLET;
-			ev_client.data.fd = fd;
-			setnonblocking(fd);
-			if(epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev_client)==-1){
-				perror("epoll_ctl: connect client");
-				epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
-			}
-
-			rio_writen(fd, buf, strlen(buf));
-			sprintf(buf, "\r\n");
-			rio_writen(fd, buf, strlen(buf));
-
-		}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
+		if((serverfd = open_clientfd(rqdata->host, rqdata->port))<0){
+			clienterror(fd, rqdata->host, "404", "Not found", "Failed to open connection to host");
+			Close(fd);
+			break;
+		}
+		rio_readinitb(&rio_server, serverfd);
+		//rio_writen(serverfd, request, strlen(request));
+		//printf("strcasecmp: %d", !strcasecmp(rqdata->method, "GET"));		
+		if(!strcmp(rqdata->version, "HTTP/1.0")){
 			sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
-			rio_writen(serverfd, request, strlen(request));			
+			rio_writen(serverfd, request, strlen(request));
 			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
-			//reply_nonconnection(serverfd, fd, &rio_server);
-			forward_reply(fd, &rio_server, cstatus);
-			if(cstatus->server_setclose || cstatus->server_shuttingdown){
-				Close(serverfd);
-				printf("closing fd: %d\n", serverfd);
-				/*if(epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL)==-1){
-					perror("epoll_ctl_del: serverfd");
-				}*/
-			}else{
-				printf("reset_oneshot: %d\n", serverfd);
-				reset_oneshot(epollfd, serverfd);
-			}
-			if(cstatus->client_setclose || cstatus->client_shuttingdown){
-				Close(fd);
-				printf("closing fd: %d\n", fd);
-				/*if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
-					perror("epoll_ctl_del: clientfd");
-				}*/
-			}else{
-				printf("reset_oneshot: %d\n", fd);
-				reset_oneshot(epollfd, fd);
-			}
-		}else{
-			//printf("rqdata: 0x%x, method: %s", rqdata, rqdata->method);
-			clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
+			reply_nonconnection(serverfd, fd, &rio_server);
 			Close(serverfd);
 			printf("closing fd: %d\n", serverfd);
 			Close(fd);
 			printf("closing fd: %d\n", fd);
+		}else if(!strcmp(rqdata->version, "HTTP/1.1")){
+			if(!strcasecmp(rqdata->method, "CONNECT")){
+				//sprintf(request, "%s %s:%s %s\r\n", rqdata->method, rqdata->host, (strlen(rqdata->port)==0 ? "443" : rqdata->port), rqdata->version);
+				//rio_writen(serverfd, request, strlen(request));
+				//printf("[forward] %s\n", request);
+				while(strcmp(buf, "\r\n") && read_bytes>0){
+					read_bytes = rio_readlineb(&rio_client, buf, MAXLINE);
+					//rio_writen(serverfd, buf, strlen(buf));
+					printf("[received] %s\n", buf);
+				}
+				//rio_writen(serverfd, buf, strlen(buf));
+				printf("[received] %s\n", buf);
+				
+				sprintf(buf, "HTTP/1.1 200 Connection established\r\n");
+				hashmap_put(fdmap, fd, serverfd);
+				hashmap_put(fdmap, serverfd, fd);
+				setnonblocking(serverfd);
+				ev_server.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+				ev_server.data.fd = serverfd;
+				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, serverfd, &ev_server)==-1){
+					perror("epoll_ctl: connect server");
+					break;
+					//exit(-1);
+				}
+				ev_client.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+				ev_client.data.fd = fd;
+				setnonblocking(fd);
+				if(epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev_client)==-1){
+					perror("epoll_ctl: connect client");
+					epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
+					Close(fd);
+					Close(serverfd);
+					break;
+				}
+
+				rio_writen(fd, buf, strlen(buf));
+				sprintf(buf, "\r\n");
+				rio_writen(fd, buf, strlen(buf));
+
+			}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
+				sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
+				rio_writen(serverfd, request, strlen(request));			
+				forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
+				//reply_nonconnection(serverfd, fd, &rio_server);
+				forward_reply(fd, &rio_server, cstatus);
+				if(cstatus->server_setclose || cstatus->server_shuttingdown){
+					printf("closing fd: %d\n", serverfd);
+					if(epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL)==-1){
+						perror("epoll_ctl_del: serverfd");
+					}
+					Close(serverfd);
+				}else{
+					printf("reset_oneshot: %d\n", serverfd);
+					reset_oneshot(epollfd, serverfd);
+				}
+				if(cstatus->client_setclose || cstatus->client_shuttingdown){
+					printf("closing fd: %d\n", fd);
+					if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+						perror("epoll_ctl_del: clientfd");
+					}
+					Close(fd);
+				}else{
+					printf("reset_oneshot: %d\n", fd);
+					reset_oneshot(epollfd, fd);
+				}
+			}else{
+				//printf("rqdata: 0x%x, method: %s", rqdata, rqdata->method);
+				clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
+				Close(serverfd);
+				printf("closing fd: %d\n", serverfd);
+				Close(fd);
+				printf("closing fd: %d\n", fd);
+			}
+		}else{
+			clienterror(fd, rqdata->version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
+			Close(fd);
+			printf("closing fd: %d\n", fd);
+			Close(serverfd);
+			printf("closing fd: %d\n", serverfd);
 		}
-	}else{
-		clienterror(fd, rqdata->version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
-	}
+	}while(0);
 	free(rqdata);
 	free(cstatus);
 

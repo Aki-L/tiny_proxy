@@ -288,7 +288,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 			case st_done:
 				break;
 			default:
-				perror("break inner parse phase");
+				printf("break inner parse phase: %d\n", state);
 				return -1;
 		}
 	}else{
@@ -296,7 +296,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 			case st_done:
 				break;
 			default:
-				perror("parse incomplete");
+				printf("parse incomplete\n");
 				return -1;
 		}
 	}

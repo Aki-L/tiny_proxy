@@ -15,14 +15,14 @@ typedef struct chmapentry{
 
 typedef struct chmapseg{
         struct chmapentry entrys[SEG_SIZE];
-        pthread_mutex_t seg_lock;
+        pthread_rwlock_t seg_lock;
 } chmapseg_t;
 
 typedef struct chmap{
 	int capacity;
         size_t size;
         struct chmapseg *segs;
-        pthread_mutex_t chmap_lock;
+        pthread_rwlock_t chmap_lock;
 } chmap_t;
 chmap_t* hashmap_init(int capacity);
 int hashmap_put(chmap_t *map, int key, int value);

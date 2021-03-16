@@ -12,14 +12,14 @@ typedef struct chmapentry{
 
 typedef struct chmapseg{
         struct chmapentry entrys[SEG_SIZE];
-        pthread_mutex_t seg_lock;
+        pthread_rwlock_t seg_lock;
 } chmapseg_t;
 
 typedef struct chmap{
 	int capacity;
         size_t size;
         struct chmapseg *segs;
-        pthread_mutex_t chmap_lock;
+        pthread_rwlock_t chmap_lock;
 } chmap_t;
 */
 chmap_t* hashmap_init(int capacity);
@@ -64,7 +64,7 @@ chmap_t *hashmap_init(int capacity){
 			break;
 		}
 		for(int i = 0 ; i < nmemb; i++){
-			pthread_mutex_init(&(segs[i].seg_lock), NULL);
+			pthread_rwlock_init(&(segs[i].seg_lock), NULL);
 		}
 
 		if(map==NULL){
@@ -75,7 +75,7 @@ chmap_t *hashmap_init(int capacity){
 		map->size = 0;
 		map->segs = segs;
 		map->capacity = capacity;
-		pthread_mutex_init(&(map->chmap_lock), NULL);
+		pthread_rwlock_init(&(map->chmap_lock), NULL);
 		return map;
 	}while(0);
 	return NULL;
@@ -95,9 +95,9 @@ void hashmap_destroy(chmap_t *map){
 				entry = tmp;
 			}
 		}
-		pthread_mutex_destroy(&(seg->seg_lock));
+		pthread_rwlock_destroy(&(seg->seg_lock));
 	}
-	pthread_mutex_destroy(&(map->chmap_lock));
+	pthread_rwlock_destroy(&(map->chmap_lock));
 }
 
 int hashmap_hash(int key){
@@ -115,13 +115,13 @@ int hashmap_putIfAbsent(chmap_t *map, int key, int value){
 		entry->value = value;
 		entry->hash = hash;
 		entry->next = NULL;
-		pthread_mutex_lock(&(seg->seg_lock));
+		pthread_rwlock_wrlock(&(seg->seg_lock));
 		while(entryhead->next!=NULL){
 			entryhead = entryhead->next;
 		}
 		entryhead->next = entry;
 		map->size++;
-		pthread_mutex_unlock(&(seg->seg_lock));
+		pthread_rwlock_unlock(&(seg->seg_lock));
 		return 1;
 	}else{
 		return 0;
@@ -139,18 +139,18 @@ int hashmap_put(chmap_t *map, int key, int value){
 		entry->value = value;
 		entry->hash = hash;
 		entry->next = NULL;
-		pthread_mutex_lock(&(seg->seg_lock));
+		pthread_rwlock_wrlock(&(seg->seg_lock));
 		while(entryhead->next!=NULL){
 			entryhead = entryhead->next;
 		}
 		entryhead->next = entry;
 		map->size++;
-		pthread_mutex_unlock(&(seg->seg_lock));
+		pthread_rwlock_unlock(&(seg->seg_lock));
 		return 1;
 	}else{
-		pthread_mutex_lock(&(seg->seg_lock));
+		pthread_rwlock_wrlock(&(seg->seg_lock));
 		entry->value = value;
-		pthread_mutex_unlock(&(seg->seg_lock));
+		pthread_rwlock_unlock(&(seg->seg_lock));
 		return 0;
 	}
 }
@@ -158,13 +158,16 @@ int hashmap_put(chmap_t *map, int key, int value){
 chmapentry_t *hashmap_getentry(chmap_t *map, int key){
 	int hash = hashmap_hash(key);
 	chmapseg_t *seg = (map->segs)+hash/SEG_SIZE;
+	pthread_rwlock_rdlock(&(seg->seg_lock));
 	chmapentry_t *entryhead = &(seg->entrys[hash%SEG_SIZE]);
 	while(entryhead != NULL){
 		entryhead = entryhead->next;
 		if(entryhead!=NULL && entryhead->key == key){
+			pthread_rwlock_unlock(&(seg->seg_lock));
 			return entryhead;
 		}
 	}
+	pthread_rwlock_unlock(&(seg->seg_lock));
 	return NULL;
 }
 
@@ -190,19 +193,24 @@ int hashmap_get(chmap_t *map, int key){
 int hashmap_remove(chmap_t *map, int key){
 	int hash = hashmap_hash(key);
 	chmapseg_t *seg = (map->segs)+hash/SEG_SIZE;
+	pthread_rwlock_rdlock(&(seg->seg_lock));
 	chmapentry_t *entryhead = &(seg->entrys[hash%SEG_SIZE]);
 	while((entryhead->next!=NULL) && ((entryhead->next)->key!=key)){
 		entryhead = entryhead->next;
 	}
-	if((entryhead->next)->key == key){
-		pthread_mutex_lock(&(seg->seg_lock));
+	pthread_rwlock_unlock(&(seg->seg_lock));
+	pthread_rwlock_wrlock(&(seg->seg_lock));
+	if((entryhead->next)!=NULL){
+		//pthread_mutex_lock(&(seg->seg_lock));
 		chmapentry_t *target = entryhead->next;
 		entryhead->next = target->next;
 		map->size--;
 		free(target);
-		pthread_mutex_unlock(&(seg->seg_lock));
+		//pthread_mutex_unlock(&(seg->seg_lock));
+		pthread_rwlock_unlock(&(seg->seg_lock));
 		return 1;
 	}else{
+		pthread_rwlock_unlock(&(seg->seg_lock));
 		return 0;
 	}
 }
