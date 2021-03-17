@@ -32,6 +32,7 @@ int isempty(queue_t *queue);
 int bqueue_remove(bqueue_t *bqueue);
 int enqueue(queue_t *queue, bqueue_entry_t *entry);
 bqueue_entry_t *dequeue(queue_t *queue);
+bqueue_remove_nonblocking(bqueue_t *bqueue);
 /*
 int main(){
 	bqueue_t *bqueue = bqueue_init();
@@ -92,6 +93,27 @@ int bqueue_insert(bqueue_t *bqueue, int data){
 
 int isempty(queue_t *queue){
 	return queue->size==0;
+}
+
+bqueue_remove_nonblocking(bqueue_t *bqueue){
+	int data;
+        assert(bqueue!=NULL);
+        bqueue_entry_t *entry;
+        pthread_mutex_lock(&(bqueue->qlock));
+        if(bqueue->shuttingdown){
+                pthread_mutex_unlock(&(bqueue->qlock));
+                return -1;
+        }
+	if(isempty(&(bqueue->queue))){
+		pthread_mutex_unlock(&(bqueue->qlock));
+		return -2;
+	}
+        entry = dequeue(&(bqueue->queue));
+        pthread_mutex_unlock(&(bqueue->qlock));
+        if(entry==NULL) return -1;
+        data = entry->data;
+        free(entry);
+        return data;
 }
 
 int bqueue_remove(bqueue_t *bqueue){

@@ -2,6 +2,7 @@
 #include "tools/threadpool.h"
 #include "tools/concurrent_hashmap.h"
 #include "tools/parse_requestline.h"
+#include "tools/bqueue.h"
 #include "proxy.h"
 #include <assert.h>
 #include <sys/epoll.h>
@@ -66,20 +67,22 @@ int reset_oneshot(int epollfd, int fd);
 
 void* do_connect(void* fdp);
 chmap_t *fdmap;
-
+bqueue_t *bqueue;
 int main(int argc, char **argv){
 	int listenfd, connfd, nfds, n, awakedfd;
 	struct epoll_event ev, events[EPOLL_EVENTS];
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t clientlen;
 	struct sockaddr_storage clientaddr;
+	pthread_t threads[CONNFD_POLL_SIZE];
 	if(argc!=2){
 		fprintf(stderr, "usage: %s <port>\n", argv[0]);
 		exit(1);
 	}
 
+	bqueue = bqueue_init();
 	listenfd = Open_listenfd(argv[1]);
-	threadpool_t *pool = threadpool_create(CONNFD_POOL_SIZE);
+	//threadpool_t *pool = threadpool_create(CONNFD_POOL_SIZE);
 	pthread_mutex_init(&connfd_mutex, NULL);
 	pthread_mutex_init(&readfd_mutex, NULL);
 	epollfd = epoll_create(EPOLL_SIZE);
@@ -94,6 +97,10 @@ int main(int argc, char **argv){
 	if(epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &ev)==-1){
 		perror("epoll_ctl: listen_sock");
 		exit(-1);
+	}
+
+	for(int i = 0; i < CONNFD_POLL_SIZE; i++){
+		pthread_create(&(threads[i]), NULL, connfd_handler, NULL);	
 	}
 
 	while(1){
@@ -119,14 +126,15 @@ int main(int argc, char **argv){
 				}
 				getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
 				printf("[main] Accept connection from (%s, %s)\n", hostname, port);
-				setnonblocking(connfd);
+				/*setnonblocking(connfd);
 				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 				ev.data.fd = connfd;
 				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev) == -1){
 					perror("epoll_ctl: connfd");
 					exit(-1);
-				}
-			}else if(hashmap_containsKey(fdmap, events[n].data.fd)){
+				}*/
+				bqueue_insert(bqueue, events[n].data.fd);
+			}/*else if(hashmap_containsKey(fdmap, events[n].data.fd)){
 				pthread_mutex_lock(&connfd_mutex);
 				threadpool_add(pool, &do_connect, (void*)(&events[n].data.fd));
 			}else{
@@ -134,16 +142,54 @@ int main(int argc, char **argv){
 				pthread_mutex_lock(&connfd_mutex);
 				threadpool_add(pool, &doit_proxy, (void*)(&(events[n].data.fd)));
 				pthread_mutex_unlock(&readfd_mutex);		
+			}*/
+			else{
+				printf("[main] unexpected fd: %d\n", fd);
 			}
 		}
 		//doit(connfd);
 		//threadpool_add(pool, &doit_proxy, (void*)(&connfd));
 	}
+	for(int i = 0 ; i < CONNFD_POOL_SIZE, i++){
+		pthread_join(threads[i], NULL);
+	}
+	bqueue_destroy(bqueue);
 	hashmap_destroy(fdmap);
-	threadpool_destroy(pool);
+	//threadpool_destroy(pool);
 	pthread_mutex_destroy(&connfd_mutex);
 	pthread_mutex_destroy(&readfd_mutex);
 
+}
+
+
+void *connfd_handler(void *args){
+	struct epoll_event ev, events[EPOLL_EVENTS];
+	int conn_epollfd, nfds;
+	conn_epollfd = epoll_create(EPOLL_SIZE);
+	if(conn_epollfd == -1){
+                perror("epoll_create error");
+                exit(-1);
+        }
+	while(1){
+		int fd = bqueue_remove_nonblocking(bqueue);
+		if(fd>0){
+			ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        ev.data.fd = fd;
+   			if(epoll_ctl(conn_epollfd, EPOLL_CTL_ADD, fd, &ev)==-1){
+        	        	perror("epoll_ctl: listen_sock");
+        	        	exit(-1);
+       			}
+		}
+
+		nfds = epoll_wait(epollfd, events, EPOLL_EVENTS, -1);
+		if(nfds == -1){
+                        perror("epoll_wait");
+                        exit(-1);
+                }
+                for(n = 0; n < nfds; n++){
+			
+		}
+	}
 }
 
 void* do_connect(void* fdp){
