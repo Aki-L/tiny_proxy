@@ -65,7 +65,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 		ch = *p++;
 		switch(state){
 			case st_start:
-				if(ch=='\r'||ch=='\n') break;
+				if(isspace(ch)) break;
 				else if(ch>'Z'||ch<'A'){
 					perror("invalid method, should constructed with A-Z\n");
 					return -1;

@@ -45,6 +45,7 @@
  * *******************************************************************************************/
 
 pthread_mutex_t connfd_mutex;
+pthread_mutex_t readfd_mutex;
 int epollfd;
 void doit(int fd);
 void *doit_proxy(void *fdp);
@@ -80,6 +81,7 @@ int main(int argc, char **argv){
 	listenfd = Open_listenfd(argv[1]);
 	threadpool_t *pool = threadpool_create(CONNFD_POOL_SIZE);
 	pthread_mutex_init(&connfd_mutex, NULL);
+	pthread_mutex_init(&readfd_mutex, NULL);
 	epollfd = epoll_create(EPOLL_SIZE);
 	if(epollfd == -1){
 		perror("epoll_create error");
@@ -95,7 +97,9 @@ int main(int argc, char **argv){
 	}
 
 	while(1){
+		pthread_mutex_lock(&(readfd_mutex));
 		nfds = epoll_wait(epollfd, events, EPOLL_EVENTS, -1);
+		pthread_mutex_unlock(&(readfd_mutex));
 		if(nfds == -1){
 			perror("epoll_wait");
 			exit(-1);
@@ -126,8 +130,10 @@ int main(int argc, char **argv){
 				pthread_mutex_lock(&connfd_mutex);
 				threadpool_add(pool, &do_connect, (void*)(&events[n].data.fd));
 			}else{
+				pthread_mutex_lock(&readfd_mutex);
 				pthread_mutex_lock(&connfd_mutex);
-				threadpool_add(pool, &doit_proxy, (void*)(&(events[n].data.fd)));		
+				threadpool_add(pool, &doit_proxy, (void*)(&(events[n].data.fd)));
+				pthread_mutex_unlock(&readfd_mutex);		
 			}
 		}
 		//doit(connfd);
@@ -136,6 +142,8 @@ int main(int argc, char **argv){
 	hashmap_destroy(fdmap);
 	threadpool_destroy(pool);
 	pthread_mutex_destroy(&connfd_mutex);
+	pthread_mutex_destroy(&readfd_mutex);
+
 }
 
 void* do_connect(void* fdp){
@@ -213,7 +221,7 @@ void doit(int fd){
 		printf("Request line:\n");
 		printf("%s\n", buf);
 		if(parse_requestline(buf, rqdata)==-1){
-			printf("parse_requestline error\nclosing fd: %d\n", buf, fd);
+			printf("parse_requestline error\nclosing fd: %d\n", fd);
 			printf("method: %s, schema: %s, hostname: %s, port: %s, loc: %s, version: %s\n", rqdata->method, rqdata->schema, rqdata->host, rqdata->port, rqdata->loc, rqdata->version);
 			clienterror(fd, method, "400", "Bad request", "Invalid request line");
 			Close(fd);

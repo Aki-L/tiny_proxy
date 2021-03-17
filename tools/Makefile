@@ -15,5 +15,8 @@ concurrent_hashmap.o : concurrent_hashmap.h
 parse_requestline.o: parse_requestline.h
 	$(CC) $(CFLAGS) -g -c parse_requestline.c $(LIB)
 
+bqueue.o: bqueue.h
+        $(CC) $(CFLAGS) -g -c bqueue.c $(LIB)
+
 clean:
 	rm -f *.o concurrent_hashmap parse_requestline
