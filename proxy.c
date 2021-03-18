@@ -68,6 +68,8 @@ int connect_handler(int clientfd, int serverfd);
 void* do_connect(void* fdp);
 chmap_t *fdmap;
 bqueue_t *bqueue;
+
+
 int main(int argc, char **argv){
 	int listenfd, connfd, nfds, n, awakedfd;
 	struct epoll_event ev, events[EPOLL_EVENTS];
@@ -161,7 +163,14 @@ int main(int argc, char **argv){
 
 }
 
-
+/***************************************************************************/
+/*  Handler used to handle the connfd received from the listenfd with
+ *  multithread. Each thread hold its own epollfd and wait in a infinite 
+ *  loop respectively. On each loop, check if there is new connfd avalible
+ *  in the bqueue, if so, multithread waiting on bqueue_remove racing for 
+ *  the bqueue_lock and get and register the connfd on success.
+ *  Parameters: NULL */
+/***************************************************************************/
 void *connfd_handler(void *args){
 	struct epoll_event ev, events[EPOLL_EVENTS];
 	int conn_epollfd, nfds;
@@ -245,6 +254,7 @@ int connect_handler(int clientfd, int serverfd){
                                                         break;
                                                 }else{
                                                         perror("read: connect_handler");
+							disconnect = 1;
                                                         break;
                                                 }
                                         }else{
@@ -268,6 +278,7 @@ int connect_handler(int clientfd, int serverfd){
                                                         break;
                                                 }else{
                                                         perror("read: connect_handler");
+							disconnect = 1;
                                                         break;
                                                 }
                                         }else{
@@ -280,6 +291,9 @@ int connect_handler(int clientfd, int serverfd){
                 }
                 if(disconnect) break;
         }
+	Close(clientfd);
+	Close(serverfd);
+	Close(connect_epollfd);
 }
 
 void* do_connect(void* fdp){
@@ -499,7 +513,7 @@ int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server){
 }
 int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
         rio_t rio;
-        int length, is_contentlength_set = 0;
+        int length, is_contentlength_set = 0, read_bytes;
         char buf[MAXLINE], type[MAXLINE], *srcp, version[MAXLINE], code[MAXLINE], msg[MAXLINE];
         char headername[MAXLINE], headerdata[MAXLINE];
 
@@ -522,8 +536,20 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
 	}
 
         while(1){
-                rio_readlineb(rp_server, buf, MAXLINE);
+                //rio_readlineb(rp_server, buf, MAXLINE);
 
+		if((read_bytes = rio_readlineb(rp_server, buf, MAXLINE))<=0){
+                        if(read_bytes<0){
+                                if((errno != EINTR) && (errno != EWOULDBLOCK) && (errno != EAGAIN)){
+                                        perror("rio_readlineb: forward_requestheader");
+                                        continue;
+                                }
+                        }else{
+                                printf("connection closed by remote client");
+                                cstatus->client_shuttingdown = 1;
+                                return -1;
+                        }
+                }
                 if(!strcmp(buf, "\r\n")) {
 			rio_writen(clientfd, buf, strlen(buf));
 			break;

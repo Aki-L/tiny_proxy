@@ -58,6 +58,7 @@ int main(){
  * **/
 int parse_requestline(char* rqline, requestline_data_t *rqdata){
 	char ch, *p, *strend, *rc_start, *rc_end;
+	printf("[parse] %s\n", rqline);
 	parse_state_t state = st_start;
 	p = rqline;
 	strend = rqline+strlen(rqline);
@@ -78,6 +79,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_space_after_method;
 					rc_end = p-1;
 					strncpy(rqdata->method, rc_start, rc_end-rc_start);
+					rqdata->method[rc_end-rc_start] = '\0';
 					if(strcmp(rqdata->method, "GET")&&strcmp(rqdata->method, "POST")&&strcmp(rqdata->method, "CONNECT")&&strcmp(rqdata->method, "HEAD")){
 						perror("unimplemented method\n");
 						return -1;
@@ -108,6 +110,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_loc;
 					rc_end = p-1;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 					rc_start = p-1;
 					break;
 				}else if(isalnum(ch)||ch=='.'||ch=='-'){
@@ -116,6 +119,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_space_before_version;
 					rc_end = p-1;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 					break;
 				}else{
 					perror("invalid char in uri");
@@ -125,10 +129,12 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 				if(ch=='/'){
 					state = st_schema_slash;
 					strncpy(rqdata->schema, rc_start, rc_end-rc_start);
+					rqdata->schema[rc_end-rc_start] = '\0';
 					break;
 				}else if(isdigit(ch)){
 					state = st_port;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 					rc_start = p-1;
 					break;
 				}else{
@@ -159,17 +165,20 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_loc;
 					rc_end = p-1;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 					rc_start = p-1;
 					break;
 				}else if(ch==':'){
 					state = st_colon_before_port;
 					rc_end = p-1;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 					break;
 				}else if(ch==' '){
 					state = st_space_before_version;
 					rc_end = p-1;
 					strncpy(rqdata->host, rc_start, rc_end-rc_start);
+					rqdata->host[rc_end-rc_start] = '\0';
 				}else{
 					perror("invalid host name\n");
 					return -1;
@@ -188,12 +197,14 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_loc;
 					rc_end = p-1;
 					strncpy(rqdata->port, rc_start, rc_end-rc_start);
+					rqdata->port[rc_end-rc_start] = '\0';
 					rc_start = p-1;
 					break;
 				}else if(ch==' '){
 					state = st_space_before_version;
 					rc_end = p-1;
 					strncpy(rqdata->port, rc_start, rc_end-rc_start);
+					rqdata->port[rc_end-rc_start] = '\0';
 					break;
 				}else if(isdigit(ch)){
 					break;
@@ -206,6 +217,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_space_before_version;
 					rc_end = p-1;
 					strncpy(rqdata->loc, rc_start, rc_end-rc_start);
+					rqdata->loc[rc_end-rc_start] = '\0';
 					break;
 				}else if(!isspace(ch)){
 					break;
@@ -269,6 +281,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 					state = st_done;
 					rc_end = p-1;
 					strncpy(rqdata->version, rc_start, rc_end-rc_start);
+					rqdata->version[rc_end-rc_start] = '\0';
 					break;
 				}else{
 					perror("invalid HTTP version\n");
@@ -284,6 +297,7 @@ int parse_requestline(char* rqline, requestline_data_t *rqdata){
 				state = st_done;
 				rc_end = p;
 				strncpy(rqdata->version, rc_start, rc_end-rc_start);
+				rqdata->version[rc_end-rc_start] = '\0';
 				break;
 			case st_done:
 				break;
