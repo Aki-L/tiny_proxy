@@ -48,7 +48,7 @@
 pthread_mutex_t connfd_mutex;
 pthread_mutex_t readfd_mutex;
 int epollfd;
-void doit(int fd);
+void doit(int fd, int epollfd);
 void *doit_proxy(void *fdp);
 int build_requesthdrs(char *rq, rio_t *rp);
 int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname);
@@ -62,9 +62,9 @@ int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server);
 int forward_chunked(int fd, rio_t *rp, char* trailer);
 int getchunksize(char *buf);
 int hex2num(char ch);
-
+void *connfd_handler(void *args);
 int reset_oneshot(int epollfd, int fd);
-
+int connect_handler(int clientfd, int serverfd);
 void* do_connect(void* fdp);
 chmap_t *fdmap;
 bqueue_t *bqueue;
@@ -74,7 +74,7 @@ int main(int argc, char **argv){
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t clientlen;
 	struct sockaddr_storage clientaddr;
-	pthread_t threads[CONNFD_POLL_SIZE];
+	pthread_t threads[CONNFD_POOL_SIZE];
 	if(argc!=2){
 		fprintf(stderr, "usage: %s <port>\n", argv[0]);
 		exit(1);
@@ -99,14 +99,14 @@ int main(int argc, char **argv){
 		exit(-1);
 	}
 
-	for(int i = 0; i < CONNFD_POLL_SIZE; i++){
+	for(int i = 0; i < CONNFD_POOL_SIZE; i++){
 		pthread_create(&(threads[i]), NULL, connfd_handler, NULL);	
 	}
 
 	while(1){
-		pthread_mutex_lock(&(readfd_mutex));
+		//pthread_mutex_lock(&(readfd_mutex));
 		nfds = epoll_wait(epollfd, events, EPOLL_EVENTS, -1);
-		pthread_mutex_unlock(&(readfd_mutex));
+		//pthread_mutex_unlock(&(readfd_mutex));
 		if(nfds == -1){
 			perror("epoll_wait");
 			exit(-1);
@@ -133,7 +133,7 @@ int main(int argc, char **argv){
 					perror("epoll_ctl: connfd");
 					exit(-1);
 				}*/
-				bqueue_insert(bqueue, events[n].data.fd);
+				bqueue_insert(bqueue, connfd);
 			}/*else if(hashmap_containsKey(fdmap, events[n].data.fd)){
 				pthread_mutex_lock(&connfd_mutex);
 				threadpool_add(pool, &do_connect, (void*)(&events[n].data.fd));
@@ -144,13 +144,13 @@ int main(int argc, char **argv){
 				pthread_mutex_unlock(&readfd_mutex);		
 			}*/
 			else{
-				printf("[main] unexpected fd: %d\n", fd);
+				printf("[main] unexpected fd: %d\n", events[n].data.fd);
 			}
 		}
 		//doit(connfd);
 		//threadpool_add(pool, &doit_proxy, (void*)(&connfd));
 	}
-	for(int i = 0 ; i < CONNFD_POOL_SIZE, i++){
+	for(int i = 0 ; i < CONNFD_POOL_SIZE; i++){
 		pthread_join(threads[i], NULL);
 	}
 	bqueue_destroy(bqueue);
@@ -171,25 +171,115 @@ void *connfd_handler(void *args){
                 exit(-1);
         }
 	while(1){
-		int fd = bqueue_remove_nonblocking(bqueue);
+		int fd = bqueue_remove(bqueue);
 		if(fd>0){
+			printf("connfd %d listened from listenfd\n", fd);
 			ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
                         ev.data.fd = fd;
    			if(epoll_ctl(conn_epollfd, EPOLL_CTL_ADD, fd, &ev)==-1){
         	        	perror("epoll_ctl: listen_sock");
         	        	exit(-1);
        			}
+		}else{
+			printf("bqueue is empty\n");
 		}
 
-		nfds = epoll_wait(epollfd, events, EPOLL_EVENTS, -1);
+		nfds = epoll_wait(conn_epollfd, events, EPOLL_EVENTS, -1);
 		if(nfds == -1){
                         perror("epoll_wait");
                         exit(-1);
                 }
-                for(n = 0; n < nfds; n++){
-			
+                for(int n = 0; n < nfds; n++){
+			doit(events[n].data.fd, conn_epollfd);
 		}
 	}
+}
+
+int connect_handler(int clientfd, int serverfd){
+        int connect_epollfd, nfds, n, disconnect;
+        struct epoll_event ev_server, ev_client, events[EPOLL_EVENTS];
+        char buf[MAXLINE];
+        connect_epollfd = epoll_create1(0);
+        if(epollfd==-1){
+                perror("epoll_create1");
+                return;
+        }
+        setnonblocking(serverfd);
+        ev_server.events = EPOLLIN | EPOLLET;
+        ev_server.data.fd = serverfd;
+        if(epoll_ctl(connect_epollfd, EPOLL_CTL_ADD, serverfd, &ev_server)==-1){
+                perror("epoll_ctl: connect server");
+                return;
+                //exit(-1);
+        }
+        ev_client.events = EPOLLIN | EPOLLET;
+        ev_client.data.fd = clientfd;
+        setnonblocking(clientfd);
+        if(epoll_ctl(connect_epollfd, EPOLL_CTL_ADD, clientfd, &ev_client)==-1){
+                perror("epoll_ctl: connect client");
+                epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
+                return;
+        }
+
+        sprintf(buf, "\r\n");
+        rio_writen(clientfd, buf, strlen(buf));
+        while(1){
+                nfds = epoll_wait(connect_epollfd, events, EPOLL_EVENTS, -1);
+                if(nfds==-1){
+                        perror("epoll_wait: connect_handler");
+                        break;
+                }
+                for(n = 0; n < nfds; n++){
+                        if(events[n].data.fd == clientfd){
+                                while(1){
+                                        int read_bytes = read(clientfd, buf, MAXLINE);
+                                        printf("[do_connect] received %d bytes from connect(%d, %d)\n", read_bytes, clientfd, serverfd);
+                                        if(read_bytes==0){
+                                                printf("[do_connect] received EOF from connect(%d, %d)\n", clientfd, serverfd);
+                                                disconnect = 1;
+                                                break;
+                                        }else if(read_bytes<0){
+                                                if(errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK){
+                                                        //rio_writen(serverfd, buf, sizeof(buf));
+                                                        //printf(("[do_connect][forward] %o\n", buf));
+                                                        break;
+                                                }else{
+                                                        perror("read: connect_handler");
+                                                        break;
+                                                }
+                                        }else{
+                                                rio_writen(serverfd, buf, read_bytes);
+                                                printf("[do_connect][forward] %o\n", buf);
+                                                if(read_bytes<MAXLINE) break;
+                                        }
+                                }
+                        }else{
+                                while(1){
+                                        int read_bytes = read(serverfd, buf, MAXLINE);
+                                        printf("[do_connect] received %d bytes from connect(%d, %d)\n", read_bytes, serverfd, clientfd);
+                                        if(read_bytes==0){
+                                                printf("[do_connect] received EOF from connect(%d, %d)\n", serverfd, clientfd);
+                                                disconnect = 1;
+                                                break;
+                                        }else if(read_bytes<0){
+                                                if(errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK){
+                                                        //rio_writen(serverfd, buf, sizeof(buf));
+                                                        //printf(("[do_connect][forward] %o\n", buf));
+                                                        break;
+                                                }else{
+                                                        perror("read: connect_handler");
+                                                        break;
+                                                }
+                                        }else{
+                                                rio_writen(clientfd, buf, read_bytes);
+                                                printf("[do_connect][forward] %o\n", buf);
+                                                if(read_bytes<MAXLINE) break;
+                                        }
+                                }
+                        }
+                }
+                if(disconnect) break;
+        }
 }
 
 void* do_connect(void* fdp){
@@ -248,10 +338,11 @@ void *doit_proxy(void *fdp){
 	int fd = *((int *)fdp);
 	printf("doit proxy with fd %d\n", fd);
 	pthread_mutex_unlock(&connfd_mutex);
-	doit(fd);
+	doit(fd, epollfd);
 }
 
-void doit(int fd){
+void doit(int fd, int epollfd){
+	printf("doit with fd %d, epollfd %d\n", fd, epollfd);
 	int is_static, is_host_set, serverfd, read_bytes;
 	struct stat sbuf;
 	char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE], rq_port[MAXLINE];
@@ -313,6 +404,8 @@ void doit(int fd){
 				printf("[received] %s\n", buf);
 				
 				sprintf(buf, "HTTP/1.1 200 Connection established\r\n");
+
+				/*
 				hashmap_put(fdmap, fd, serverfd);
 				hashmap_put(fdmap, serverfd, fd);
 				setnonblocking(serverfd);
@@ -335,8 +428,9 @@ void doit(int fd){
 				}
 
 				rio_writen(fd, buf, strlen(buf));
-				sprintf(buf, "\r\n");
+				sprintf(buf, "\r\n");*/
 				rio_writen(fd, buf, strlen(buf));
+				connect_handler(fd, serverfd);
 
 			}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
 				sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
@@ -344,16 +438,15 @@ void doit(int fd){
 				forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
 				//reply_nonconnection(serverfd, fd, &rio_server);
 				forward_reply(fd, &rio_server, cstatus);
-				if(cstatus->server_setclose || cstatus->server_shuttingdown){
+				/*if(cstatus->server_setclose || cstatus->server_shuttingdown){
 					printf("closing fd: %d\n", serverfd);
 					if(epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL)==-1){
 						perror("epoll_ctl_del: serverfd");
 					}
 					Close(serverfd);
-				}else{
-					printf("reset_oneshot: %d\n", serverfd);
-					reset_oneshot(epollfd, serverfd);
-				}
+				}*/
+				Close(serverfd);
+				printf("closing fd: %d\n", serverfd);
 				if(cstatus->client_setclose || cstatus->client_shuttingdown){
 					printf("closing fd: %d\n", fd);
 					if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
