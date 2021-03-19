@@ -184,13 +184,14 @@ void *connfd_handler(void *args){
 		if(fd>0){
 			printf("connfd %d listened from listenfd\n", fd);
 			ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+			setnonblocking(fd);
                         ev.data.fd = fd;
    			if(epoll_ctl(conn_epollfd, EPOLL_CTL_ADD, fd, &ev)==-1){
         	        	perror("epoll_ctl: listen_sock");
         	        	exit(-1);
        			}
 		}else{
-			printf("bqueue is empty\n");
+			//printf("bqueue is empty\n");
 		}
 
 		nfds = epoll_wait(conn_epollfd, events, EPOLL_EVENTS, -1);
@@ -202,11 +203,22 @@ void *connfd_handler(void *args){
 			doit(events[n].data.fd, conn_epollfd);
 		}
 	}
+	Close(conn_epollfd);
 }
 
+
+
+/**********************************************************************************************/
+/* Handles request with CONNECT method accepted from clientfd, the connected peer is on serverfd
+ * . connect_handler register both clientfd and serverfd into a seperate epollfd to make a tunnel
+ * for transforming data between c/s. data tunnel build in an infinite loop, only when read returns
+ *  0 which indicating EOF or returns -1 with unexpected errno would the loop break and return.
+ *  Parameters: the socket fd of client and server*/
+/**********************************************************************************************/
+
 int connect_handler(int clientfd, int serverfd){
-        int connect_epollfd, nfds, n, disconnect;
-        struct epoll_event ev_server, ev_client, events[EPOLL_EVENTS];
+	int connect_epollfd, nfds, n, disconnect=0;
+	struct epoll_event ev_server, ev_client, events[EPOLL_EVENTS];
         char buf[MAXLINE];
         connect_epollfd = epoll_create1(0);
         if(epollfd==-1){
@@ -218,15 +230,20 @@ int connect_handler(int clientfd, int serverfd){
         ev_server.data.fd = serverfd;
         if(epoll_ctl(connect_epollfd, EPOLL_CTL_ADD, serverfd, &ev_server)==-1){
                 perror("epoll_ctl: connect server");
+		Close(clientfd);
+        	Close(serverfd);
+        	Close(connect_epollfd);
                 return;
-                //exit(-1);
         }
         ev_client.events = EPOLLIN | EPOLLET;
         ev_client.data.fd = clientfd;
         setnonblocking(clientfd);
         if(epoll_ctl(connect_epollfd, EPOLL_CTL_ADD, clientfd, &ev_client)==-1){
                 perror("epoll_ctl: connect client");
-                epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
+                epoll_ctl(connect_epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
+		Close(clientfd);
+        	Close(serverfd);
+        	Close(connect_epollfd);
                 return;
         }
 
@@ -249,12 +266,10 @@ int connect_handler(int clientfd, int serverfd){
                                                 break;
                                         }else if(read_bytes<0){
                                                 if(errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK){
-                                                        //rio_writen(serverfd, buf, sizeof(buf));
-                                                        //printf(("[do_connect][forward] %o\n", buf));
                                                         break;
                                                 }else{
                                                         perror("read: connect_handler");
-							disconnect = 1;
+							//disconnect = 1;
                                                         break;
                                                 }
                                         }else{
@@ -273,12 +288,10 @@ int connect_handler(int clientfd, int serverfd){
                                                 break;
                                         }else if(read_bytes<0){
                                                 if(errno==EINTR || errno==EAGAIN || errno==EWOULDBLOCK){
-                                                        //rio_writen(serverfd, buf, sizeof(buf));
-                                                        //printf(("[do_connect][forward] %o\n", buf));
                                                         break;
                                                 }else{
                                                         perror("read: connect_handler");
-							disconnect = 1;
+							//disconnect = 1;
                                                         break;
                                                 }
                                         }else{
@@ -289,13 +302,23 @@ int connect_handler(int clientfd, int serverfd){
                                 }
                         }
                 }
+		printf("disconnect: %d\n", disconnect);
                 if(disconnect) break;
         }
+	printf("[connect_handler] Closing fd...\n");
 	Close(clientfd);
 	Close(serverfd);
 	Close(connect_epollfd);
 }
 
+
+
+/****************************************************************************************************************/
+/* Old version of connect_handler, do_connect is user to handle one epollin event of the regitered fd of which are
+ * marked as tunnel fd by adding to concurrent hashmap. On read returning 0, close tunnel fds and removes from 
+ * epollfd, else, remodification them cause register set EPOLLONESHOT flag
+ * Parameter: the pointer of activated clientfd*/
+/****************************************************************************************************************/
 void* do_connect(void* fdp){
 	int clientfd = *((int *)fdp);
 	struct epoll_event ev;
@@ -336,6 +359,12 @@ void* do_connect(void* fdp){
 	reset_oneshot(epollfd, clientfd);
 }
 
+
+
+/********************************************************************************/
+/* Rearm the fd with EPOLLONESHOT set into the epollfd
+ * Parameters: epollfd and the fd to be rearm*/
+/********************************************************************************/
 int reset_oneshot(int epollfd, int fd){
     struct epoll_event event;
     event.data.fd = fd;
@@ -343,11 +372,24 @@ int reset_oneshot(int epollfd, int fd){
     return epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 }
 
+
+
+/********************************************************************************/
+/* Set to nonblocking mode.
+ * Parameters: fd*/
+/********************************************************************************/
 int setnonblocking(int fd){
 	int flag = fcntl(fd, F_GETFL, 0);
 	fcntl(fd, F_SETFL, flag| O_NONBLOCK);
 }
 
+
+
+
+/********************************************************************************/
+/* Wrapper function for doit() to fit pthread_create(3)
+ * Parameters: pointer to the fd to be passed into doit()*/
+/********************************************************************************/
 void *doit_proxy(void *fdp){
 	int fd = *((int *)fdp);
 	printf("doit proxy with fd %d\n", fd);
@@ -355,6 +397,15 @@ void *doit_proxy(void *fdp){
 	doit(fd, epollfd);
 }
 
+
+
+
+/********************************************************************************/
+/* Main service logic, takes the activated fd and the epollfd it activated from as
+ *  parameter. Parse the request to method/schema/host/port/loc/version and process
+ *  them with corresponding functions.
+ *  Parameters: fd received from epoll_wait and the corresponding epollfd*/
+/********************************************************************************/
 void doit(int fd, int epollfd){
 	printf("doit with fd %d, epollfd %d\n", fd, epollfd);
 	int is_static, is_host_set, serverfd, read_bytes;
@@ -367,6 +418,7 @@ void doit(int fd, int epollfd){
 	connection_status_t *cstatus = (connection_status_t *)malloc(sizeof(connection_status_t));
 
 	do{
+		/* Read the request line and parse */
 		rio_readinitb(&rio_client, fd);
 		rio_readlineb(&rio_client, buf, MAXLINE);
 		printf("Request line:\n");
@@ -378,87 +430,65 @@ void doit(int fd, int epollfd){
 			Close(fd);
 			break;
 		}
-		//sscanf(buf, "%s %*[^/]//%[^/]%[^ ] %s", method, hostname, uri, version);
 		printf("method: %s, schema: %s, hostname: %s, port: %s, loc: %s, version: %s\n", rqdata->method, rqdata->schema, rqdata->host, rqdata->port, rqdata->loc, rqdata->version);
-	//	if(strcasecmp(method, "GET")){
-	//		clienterror(fd, method, "501", "Not implemented", "Proxy does not implement this method");
-	//		return;
-	//	}
-		//sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
-		//parse_hostname(hostname, rq_port);
+		if(strlen(rqdata->port)==0) strcpy(rqdata->port, "80");
 
+
+		/* Open the serverfd which the requestline requested */
 		if((serverfd = open_clientfd(rqdata->host, rqdata->port))<0){
 			clienterror(fd, rqdata->host, "404", "Not found", "Failed to open connection to host");
 			Close(fd);
 			break;
 		}
 		rio_readinitb(&rio_server, serverfd);
-		//rio_writen(serverfd, request, strlen(request));
-		//printf("strcasecmp: %d", !strcasecmp(rqdata->method, "GET"));		
+
+
+		/* Process the request according to it request_data */
 		if(!strcmp(rqdata->version, "HTTP/1.0")){
+			/* HTTP/1.0 request: set nonconnection default */
 			sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
 			rio_writen(serverfd, request, strlen(request));
 			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
 			reply_nonconnection(serverfd, fd, &rio_server);
+
+			/* Close clientfd and serverfd */
 			Close(serverfd);
 			printf("closing fd: %d\n", serverfd);
 			Close(fd);
 			printf("closing fd: %d\n", fd);
 		}else if(!strcmp(rqdata->version, "HTTP/1.1")){
+			/* HTTP/1.1 request: persistent connection if connection header is not set to close */
+			
 			if(!strcasecmp(rqdata->method, "CONNECT")){
-				//sprintf(request, "%s %s:%s %s\r\n", rqdata->method, rqdata->host, (strlen(rqdata->port)==0 ? "443" : rqdata->port), rqdata->version);
-				//rio_writen(serverfd, request, strlen(request));
-				//printf("[forward] %s\n", request);
+				/* CONNECT method with HTTP/1.1 */
+
+				/* read the rest CONNECT request headers and do nothing */
 				while(strcmp(buf, "\r\n") && read_bytes>0){
 					read_bytes = rio_readlineb(&rio_client, buf, MAXLINE);
-					//rio_writen(serverfd, buf, strlen(buf));
 					printf("[received] %s\n", buf);
 				}
-				//rio_writen(serverfd, buf, strlen(buf));
 				printf("[received] %s\n", buf);
 				
+				/* On success, reply code 200 and Connection established */
 				sprintf(buf, "HTTP/1.1 200 Connection established\r\n");
-
-				/*
-				hashmap_put(fdmap, fd, serverfd);
-				hashmap_put(fdmap, serverfd, fd);
-				setnonblocking(serverfd);
-				ev_server.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-				ev_server.data.fd = serverfd;
-				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, serverfd, &ev_server)==-1){
-					perror("epoll_ctl: connect server");
-					break;
-					//exit(-1);
-				}
-				ev_client.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-				ev_client.data.fd = fd;
-				setnonblocking(fd);
-				if(epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev_client)==-1){
-					perror("epoll_ctl: connect client");
-					epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, &ev_server);
-					Close(fd);
-					Close(serverfd);
-					break;
-				}
-
 				rio_writen(fd, buf, strlen(buf));
-				sprintf(buf, "\r\n");*/
-				rio_writen(fd, buf, strlen(buf));
+
+				/* call connect_handler to process the connect loop */
 				connect_handler(fd, serverfd);
 
 			}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
+				/* GET or POST method */
+
+				/* forward request line */
 				sprintf(request, "%s %s %s\r\n", rqdata->method, rqdata->loc, rqdata->version);
-				rio_writen(serverfd, request, strlen(request));			
+				rio_writen(serverfd, request, strlen(request));
+
+
+				/* do request and reply */
 				forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
-				//reply_nonconnection(serverfd, fd, &rio_server);
 				forward_reply(fd, &rio_server, cstatus);
-				/*if(cstatus->server_setclose || cstatus->server_shuttingdown){
-					printf("closing fd: %d\n", serverfd);
-					if(epoll_ctl(epollfd, EPOLL_CTL_DEL, serverfd, NULL)==-1){
-						perror("epoll_ctl_del: serverfd");
-					}
-					Close(serverfd);
-				}*/
+
+				/* close server fd by default and clientfd according to client_setclose and client_shutting down flag */
 				Close(serverfd);
 				printf("closing fd: %d\n", serverfd);
 				if(cstatus->client_setclose || cstatus->client_shuttingdown){
@@ -472,7 +502,7 @@ void doit(int fd, int epollfd){
 					reset_oneshot(epollfd, fd);
 				}
 			}else{
-				//printf("rqdata: 0x%x, method: %s", rqdata, rqdata->method);
+				/* unimplemented HTTP/1.1 methods, close fd */
 				clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
 				Close(serverfd);
 				printf("closing fd: %d\n", serverfd);
@@ -480,6 +510,7 @@ void doit(int fd, int epollfd){
 				printf("closing fd: %d\n", fd);
 			}
 		}else{
+			/* unimplemented HTTP version, close fd */
 			clienterror(fd, rqdata->version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
 			Close(fd);
 			printf("closing fd: %d\n", fd);
@@ -487,22 +518,21 @@ void doit(int fd, int epollfd){
 			printf("closing fd: %d\n", serverfd);
 		}
 	}while(0);
+
+
+	/* release malloced space */
 	free(rqdata);
 	free(cstatus);
 
-	/*
-	is_host_set = build_requesthdrs(request, &rio);
-	set_defaultrequesthdrs(request, is_host_set, hostname);
-	clientfd = forward_requesthdrs(hostname, rq_port, request);
-	build_reply(clientfd, reply);
-	rio_writen(fd, reply, strlen(reply));
-	*/
-
-
-	//forward_reply(serverfd, fd);
-	//Close(serverfd);
 }
 
+
+
+/********************************************************************************/
+/* Forward reply received from serverfd to clientfd, assert serverfd would close
+ * when data transfer completed. Rerurn only when received 0 from serverfd.
+ * Parameters: serverfd, cliented, server rio_t.*/
+/********************************************************************************/
 int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server){
 	char buf[MAXLINE];
 	size_t n;
@@ -511,6 +541,16 @@ int reply_nonconnection(int serverfd, int clientfd, rio_t *rp_server){
 		rio_writen(clientfd, buf, n);
 	}
 }
+
+
+
+
+/********************************************************************************/
+/* Premier function for forwarding reply. Parses response headers and behave 
+ * according to the header data. implement chunked encoding and content-length
+ *  type response, otherwise, return a clienterror with code 400.
+ *  Parameters: clientfd, server rio_t, connection_status data*/
+/********************************************************************************/
 int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
         rio_t rio;
         int length, is_contentlength_set = 0, read_bytes;
@@ -522,6 +562,8 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
 		cstatus->server_shuttingdown = 1;
 		return 0;
 	}
+
+	/* Process response heeader */
 	sscanf(buf, "%s %s %s", version, code, msg);
 	if(!strcmp(version, "HTTP/1.0")){
 		cstatus->server_setclose = 1;
@@ -536,8 +578,6 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
 	}
 
         while(1){
-                //rio_readlineb(rp_server, buf, MAXLINE);
-
 		if((read_bytes = rio_readlineb(rp_server, buf, MAXLINE))<=0){
                         if(read_bytes<0){
                                 if((errno != EINTR) && (errno != EWOULDBLOCK) && (errno != EAGAIN)){
@@ -587,6 +627,8 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
 		rio_writen(clientfd, buf, strlen(buf));
         }
 
+
+	/* Process response body */
 	if(!strcasecmp(cstatus->server_transfer_encoding, "chunked")){
                 forward_chunked(clientfd, rp_server, cstatus->server_trailer);
         }else if(is_contentlength_set){
@@ -601,26 +643,25 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
                 cstatus->server_setclose = 1;
         }
 
-	/* devide and process response body */
-	/*
-	char nbuf[length+1];
-        if(rio_readnb(rp_server, nbuf, length)==0){
-		cstatus->server_shuttingdown = 1;
-		return 0;
-	}
-        rio_writen(clientfd, nbuf, length);
-        return 0;
-	*/
 }
 
+
+
+/********************************************************************************/
+/* Forward request header from client to server. This function parse the request 
+ * header and behaves different according to the request data, similar to forward_reply() 
+ * . When requested method is POST, the function also implement chunked or content-length
+ *  style of transforming request data;
+ *  Parameters: serverfd, client rio_t, host, version, method, connection status data*/
+/********************************************************************************/
 int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *method, connection_status_t *cstatus){
         char buf[MAXLINE], headername[MAXLINE], headerdata[MAXLINE];
         int is_host_set = 0, is_contentlength_set = 0, read_bytes;
 
         printf("Request header:\n");
 
-	sprintf(buf, "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n");      
-        rio_writen(fd, buf, strlen(buf));
+	//sprintf(buf, "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n");      
+        //rio_writen(fd, buf, strlen(buf));
         sprintf(buf, "Connection: close\r\n");     
         rio_writen(fd, buf, strlen(buf));
         sprintf(buf, "Proxy-Connection: close\r\n");
@@ -651,7 +692,7 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
                 sscanf(buf, "%[^:]: %s", headername, headerdata);
                 if(!strcmp(headername, "Host")) is_host_set = 1;
 		if(!strcmp(headername, "User-Agent")){
-			continue;
+			//continue;
 		}
 		if(!strcmp(headername, "Connection")){
 			printf("[client] Connection: %s\n", headerdata);
@@ -703,41 +744,60 @@ int forward_requestheader(int fd, rio_t *rp, char *host, char *version, char *me
 	return 0;
 }
 
+
+
+/********************************************************************************/
+/* Transfer data which are marked as chunked transfer encoding. On success, return
+ *  the whole content-length which is the sum of all the chunk size. when trailer is
+ *   set, chunk end up with extra trailer header and finally \r\n.
+ *  Parameters: peer fd, peer rio_t, trailer*/
+/********************************************************************************/
 int forward_chunked(int fd, rio_t *rp, char* trailer){
 	char buf[MAXLINE];
 	int read_bytes, chunksize, content_length;
 	while(1){
 		read_bytes = rio_readlineb(rp, buf, MAXLINE);
-		if(strcmp(buf, "0\r\n")){
+		printf("[chunk] %s\n", buf);
+		if(!strcmp(buf, "0\r\n")){
+			printf("encounter end chunk\n");
 			rio_writen(fd, buf, read_bytes);
 			break;
 		}
 		chunksize = getchunksize(buf);
+		printf("[chunk] read %d bytes chunk\n", chunksize);
 		if(chunksize == -1){
 			perror("invalid chunk");
 			return -1;
 		}
 		content_length += chunksize;
 		read_bytes = rio_readnb(rp, buf, chunksize+2);
-		rio_writen(fd, buf, chunksize+2);
+		rio_writen(fd, buf, read_bytes);
 	}
 	if(strlen(trailer)!=0){
 		read_bytes = rio_readlineb(rp, buf, MAXLINE);
+		printf("[chunk] %s\n", buf);
 		rio_writen(fd, buf, read_bytes);
 	}
 	read_bytes = rio_readlineb(rp, buf, MAXLINE);
+	printf("[chunk] %s\n", buf);
 	assert(!strcmp(buf, "\r\n"));
 	rio_writen(fd, buf, read_bytes);
 	return content_length;
 }
 
+
+
+/********************************************************************************/
+/* Decode the chunk, get chunk size from the first line of each chunk
+ * Parameters: the first line of trunk*/
+/********************************************************************************/
 int getchunksize(char *buf){
 	int i, num=0, digit;
 	char ch;
 	for(i = 0 ; i < MAXLINE; i++){
 		ch = buf[i];
-		num*=16;
 		if(!isxdigit(ch)) break;
+		num*=16;
 		digit = hex2num(ch);
 		if(digit==-1) return -1;
 		num+=digit;
@@ -745,6 +805,12 @@ int getchunksize(char *buf){
 	return num;
 }
 
+
+
+/********************************************************************************/
+/* Cast hex string to its decimal int value.
+ * Parameters: hex string*/
+/********************************************************************************/
 int hex2num(char ch){
 	if(ch>= '0' && ch<='9'){
 		return ch-'0';
@@ -758,6 +824,13 @@ int hex2num(char ch){
 	return -1;
 }
 
+
+
+
+/********************************************************************************/
+/* Old version function used to build reply with received data from serverfd.
+ * Parameters: serverfd, reply buffer used to save built reply.*/
+/********************************************************************************/
 int build_reply(int fd, char *reply){
 	rio_t rio;
 	int length;
@@ -796,6 +869,12 @@ int build_reply(int fd, char *reply){
 	return 0;
 }
 
+
+
+/********************************************************************************/
+/* Old version funtion used to set default request header for HTTP/1.0 for consistency.
+ * Parameters: buffer, flag if host is set in original request, hostname*/
+/********************************************************************************/
 int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname){
 	if(!is_host_set){
 		printf("Host set in original request");
@@ -809,6 +888,15 @@ int set_defaultrequesthdrs(char *rq, int is_host_set, char* hostname){
 	return 0;
 }
 
+
+
+
+
+/********************************************************************************/
+/* Old version function to build request header except the default one defined in
+ * set_defaultrequesthdrs().
+ * Parameters: buffer, client rio_t.*/
+/********************************************************************************/
 int build_requesthdrs(char *rq, rio_t *rp){
 	char buf[MAXLINE], headername[MAXLINE], headerdata[MAXLINE];
 	int is_host_set = 0;

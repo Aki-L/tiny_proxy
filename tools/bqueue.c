@@ -32,7 +32,7 @@ int isempty(queue_t *queue);
 int bqueue_remove(bqueue_t *bqueue);
 int enqueue(queue_t *queue, bqueue_entry_t *entry);
 bqueue_entry_t *dequeue(queue_t *queue);
-bqueue_remove_nonblocking(bqueue_t *bqueue);
+int bqueue_remove_nonblocking(bqueue_t *bqueue);
 /*
 int main(){
 	bqueue_t *bqueue = bqueue_init();
@@ -95,7 +95,7 @@ int isempty(queue_t *queue){
 	return queue->size==0;
 }
 
-bqueue_remove_nonblocking(bqueue_t *bqueue){
+int bqueue_remove_nonblocking(bqueue_t *bqueue){
 	int data;
         assert(bqueue!=NULL);
         bqueue_entry_t *entry;
