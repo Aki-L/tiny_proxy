@@ -1,9 +1,37 @@
+/* proxy - a tiny HTTP proxy
+** 
+** Copyright © 2021 by Aki <akiyama310050@gmail.com>.
+** All rights reserved.
+**
+** A tiny web proxy implements http/https proxy.
+** 
+** THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+** ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+** IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+** ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+** FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+** DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+** OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+** HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+** LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+** OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+** SUCH DAMAGE.
+*/
+
+
+/* caspp rio package */
 #include "csapp.h"
+
+/* tools package */
 #include "tools/threadpool.h"
 #include "tools/concurrent_hashmap.h"
 #include "tools/parse_requestline.h"
 #include "tools/bqueue.h"
+
+/* head file */
 #include "proxy.h"
+
+/* library */
 #include <assert.h>
 #include <sys/epoll.h>
 
@@ -12,42 +40,8 @@
 #define EPOLL_EVENTS 100
 #define HASHMAP_SIZE 100
 
-/**********************************************************************************************/
-/*
- *
- *
- *
- *                  typedef struct connection_status{
- *                          int client_setclose;
- *                          int server_setclose;
- *                          char client_transfer_encoding[TYPESTRLEN];
- *                          char server_transfer_encoding[TYPESTRLEN];
- *                          int client_shuttingdown;
- *                          int server_shuttingdown;
- *                          int client_content_length;
- *                          int server_content_length;
- *                          char content_type[TYPESTRLEN];
- *                  } connection_status_t;
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- *
- * *******************************************************************************************/
 
-pthread_mutex_t connfd_mutex;
-pthread_mutex_t readfd_mutex;
-int epollfd;
+/* declarations */
 void doit(int fd, int epollfd);
 void *doit_proxy(void *fdp);
 int build_requesthdrs(char *rq, rio_t *rp);
@@ -66,12 +60,26 @@ void *connfd_handler(void *args);
 int reset_oneshot(int epollfd, int fd);
 int connect_handler(int clientfd, int serverfd);
 void* do_connect(void* fdp);
+
+/* global variables */
+
+
+/* concurrent hashmap for fd pairs */
 chmap_t *fdmap;
+
+/* blocking queue for passing fd to handler threads */
 bqueue_t *bqueue;
+
+/* mutex for passing fd pointer passing and dereferencing in multithread condition */
+pthread_mutex_t connfd_mutex;
+pthread_mutex_t readfd_mutex;
+
+/* listening fd epollfd and worker thread epollfd lists */
+int epollfd, epoll_list[CONNFD_POOL_SIZE];
 
 
 int main(int argc, char **argv){
-	int listenfd, connfd, nfds, n, awakedfd;
+	int listenfd, connfd, nfds, n, awakedfd, round_robin = 0;
 	struct epoll_event ev, events[EPOLL_EVENTS];
 	char hostname[MAXLINE], port[MAXLINE];
 	socklen_t clientlen;
@@ -102,7 +110,9 @@ int main(int argc, char **argv){
 	}
 
 	for(int i = 0; i < CONNFD_POOL_SIZE; i++){
-		pthread_create(&(threads[i]), NULL, connfd_handler, NULL);	
+		pthread_mutex_lock(&connfd_mutex);
+		int j = i;
+		pthread_create(&(threads[i]), NULL, connfd_handler, &j);	
 	}
 
 	while(1){
@@ -128,14 +138,20 @@ int main(int argc, char **argv){
 				}
 				getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0);
 				printf("[main] Accept connection from (%s, %s)\n", hostname, port);
-				/*setnonblocking(connfd);
+				
+				
+				setnonblocking(connfd);
 				ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 				ev.data.fd = connfd;
-				if(epoll_ctl(epollfd, EPOLL_CTL_ADD, connfd, &ev) == -1){
+				assert(epoll_list[round_robin]>0);
+				if(epoll_ctl(epoll_list[round_robin], EPOLL_CTL_ADD, connfd, &ev) == -1){
 					perror("epoll_ctl: connfd");
 					exit(-1);
-				}*/
-				bqueue_insert(bqueue, connfd);
+				}
+
+				round_robin = (round_robin+1)%CONNFD_POOL_SIZE;
+				//bqueue_insert(bqueue, connfd);
+				
 			}/*else if(hashmap_containsKey(fdmap, events[n].data.fd)){
 				pthread_mutex_lock(&connfd_mutex);
 				threadpool_add(pool, &do_connect, (void*)(&events[n].data.fd));
@@ -149,8 +165,6 @@ int main(int argc, char **argv){
 				printf("[main] unexpected fd: %d\n", events[n].data.fd);
 			}
 		}
-		//doit(connfd);
-		//threadpool_add(pool, &doit_proxy, (void*)(&connfd));
 	}
 	for(int i = 0 ; i < CONNFD_POOL_SIZE; i++){
 		pthread_join(threads[i], NULL);
@@ -163,6 +177,11 @@ int main(int argc, char **argv){
 
 }
 
+
+
+
+
+
 /***************************************************************************/
 /*  Handler used to handle the connfd received from the listenfd with
  *  multithread. Each thread hold its own epollfd and wait in a infinite 
@@ -172,15 +191,19 @@ int main(int argc, char **argv){
  *  Parameters: NULL */
 /***************************************************************************/
 void *connfd_handler(void *args){
+	int i = *((int *)args);
+	pthread_mutex_unlock(&(connfd_mutex));
+	printf("[connfd] receive parameter: %d", i);
 	struct epoll_event ev, events[EPOLL_EVENTS];
 	int conn_epollfd, nfds;
 	conn_epollfd = epoll_create(EPOLL_SIZE);
+	epoll_list[i] = conn_epollfd;
 	if(conn_epollfd == -1){
                 perror("epoll_create error");
                 exit(-1);
         }
 	while(1){
-		int fd = bqueue_remove(bqueue);
+		/*int fd = bqueue_remove(bqueue);
 		if(fd>0){
 			printf("connfd %d listened from listenfd\n", fd);
 			ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
@@ -193,7 +216,7 @@ void *connfd_handler(void *args){
 		}else{
 			//printf("bqueue is empty\n");
 		}
-
+		*/
 		nfds = epoll_wait(conn_epollfd, events, EPOLL_EVENTS, -1);
 		if(nfds == -1){
                         perror("epoll_wait");
@@ -205,6 +228,8 @@ void *connfd_handler(void *args){
 	}
 	Close(conn_epollfd);
 }
+
+
 
 
 
@@ -274,7 +299,7 @@ int connect_handler(int clientfd, int serverfd){
                                                 }
                                         }else{
                                                 rio_writen(serverfd, buf, read_bytes);
-                                                printf("[do_connect][forward] %o\n", buf);
+                                                //printf("[do_connect][forward] %o\n", buf);
                                                 if(read_bytes<MAXLINE) break;
                                         }
                                 }
@@ -296,7 +321,7 @@ int connect_handler(int clientfd, int serverfd){
                                                 }
                                         }else{
                                                 rio_writen(clientfd, buf, read_bytes);
-                                                printf("[do_connect][forward] %o\n", buf);
+                                                //printf("[do_connect][forward] %o\n", buf);
                                                 if(read_bytes<MAXLINE) break;
                                         }
                                 }
@@ -310,6 +335,8 @@ int connect_handler(int clientfd, int serverfd){
 	Close(serverfd);
 	Close(connect_epollfd);
 }
+
+
 
 
 
@@ -361,6 +388,7 @@ void* do_connect(void* fdp){
 
 
 
+
 /********************************************************************************/
 /* Rearm the fd with EPOLLONESHOT set into the epollfd
  * Parameters: epollfd and the fd to be rearm*/
@@ -371,6 +399,7 @@ int reset_oneshot(int epollfd, int fd){
     event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
     return epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
 }
+
 
 
 
@@ -451,6 +480,9 @@ void doit(int fd, int epollfd){
 			forward_requestheader(serverfd, &rio_client, rqdata->host, rqdata->version, rqdata->method, cstatus);
 			reply_nonconnection(serverfd, fd, &rio_server);
 
+			if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+                        	perror("epoll_ctl_del: clientfd");
+                        }
 			/* Close clientfd and serverfd */
 			Close(serverfd);
 			printf("closing fd: %d\n", serverfd);
@@ -474,6 +506,9 @@ void doit(int fd, int epollfd){
 				rio_writen(fd, buf, strlen(buf));
 
 				/* call connect_handler to process the connect loop */
+				if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+                                	perror("epoll_ctl_del: clientfd");
+                                }
 				connect_handler(fd, serverfd);
 
 			}else if (!strcasecmp(rqdata->method, "GET")||!strcasecmp(rqdata->method, "POST")){
@@ -504,6 +539,9 @@ void doit(int fd, int epollfd){
 			}else{
 				/* unimplemented HTTP/1.1 methods, close fd */
 				clienterror(fd, rqdata->method, "501", "Not implemented", "Proxy does not implement this method");
+				if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+                                	perror("epoll_ctl_del: clientfd");
+                                }
 				Close(serverfd);
 				printf("closing fd: %d\n", serverfd);
 				Close(fd);
@@ -512,6 +550,9 @@ void doit(int fd, int epollfd){
 		}else{
 			/* unimplemented HTTP version, close fd */
 			clienterror(fd, rqdata->version, "501", "Not implemented", "Proxy does not implement this version of HTTP protocal");
+			if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL)==-1){
+                        	perror("epoll_ctl_del: clientfd");
+                        }
 			Close(fd);
 			printf("closing fd: %d\n", fd);
 			Close(serverfd);
@@ -644,6 +685,7 @@ int forward_reply(int clientfd, rio_t *rp_server, connection_status_t *cstatus){
         }
 
 }
+
 
 
 
@@ -787,6 +829,7 @@ int forward_chunked(int fd, rio_t *rp, char* trailer){
 
 
 
+
 /********************************************************************************/
 /* Decode the chunk, get chunk size from the first line of each chunk
  * Parameters: the first line of trunk*/
@@ -804,6 +847,7 @@ int getchunksize(char *buf){
 	}
 	return num;
 }
+
 
 
 
@@ -871,6 +915,7 @@ int build_reply(int fd, char *reply){
 
 
 
+
 /********************************************************************************/
 /* Old version funtion used to set default request header for HTTP/1.0 for consistency.
  * Parameters: buffer, flag if host is set in original request, hostname*/
@@ -916,6 +961,13 @@ int build_requesthdrs(char *rq, rio_t *rp){
 	return is_host_set;
 }
 
+
+
+
+/********************************************************************************/
+/* Old version forward built request header from to server.
+ * Parameters: hostname and port for openclientfd, built request*/
+/********************************************************************************/
 int forward_requesthdrs(char *hostname, char *rq_port, char *request){
 	int clientfd;
 
@@ -925,6 +977,14 @@ int forward_requesthdrs(char *hostname, char *rq_port, char *request){
 	return clientfd;
 }
 
+
+
+
+/********************************************************************************/
+/* Old version of parsing hostname and port from a host:port pair, if no port
+ * exists, set default port as 80.
+ * Parameters: host:port pair string, port buffer*/
+/********************************************************************************/
 int parse_hostname(char *hostname, char *port){
 	char *token, *save_ptr;
 	const char s[2] = ":";
@@ -937,6 +997,13 @@ int parse_hostname(char *hostname, char *port){
 	return 0;
 }
 
+
+
+
+/********************************************************************************/
+/* Set and send client error html to client.
+ * Parameters: clientfd, caust string, errcode, shortmsg, longmsg*/
+/********************************************************************************/
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg){
 	char buf[MAXLINE], body[MAXBUF];
 
